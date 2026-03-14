@@ -18,6 +18,29 @@ Notification & Integration Hub (Webhooks, Slack, Email, Jira)
 ### Synopsis
 Artemis discovers vulnerabilities continuously, but there is currently no mechanism to proactively alert teams when critical findings are discovered. CSIRT operators must manually check the dashboard or wait for scheduled report exports. This project builds a configurable notification and integration layer that enables real-time alerts via Slack, Microsoft Teams, Email, generic webhooks, and Jira ticket creation — driven by a flexible rules engine that lets operators define exactly when and how they want to be notified.
 
+### The Gap
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  CURRENT: Finding sits silently in DB until manual check            │
+│                                                                     │
+│  Module finds vuln ──► DB stores TaskResult ──► ??? ──► Operator   │
+│                                                   │      checks    │
+│                                               Hours or             │
+│                                               days later           │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  PROPOSED: Instant alert through team's existing tools              │
+│                                                                     │
+│  Module finds vuln ──► DB stores TaskResult ──► Rules Engine ──►   │
+│                                                     │              │
+│                                     ┌───────────────┼───────────┐  │
+│                                     ▼               ▼           ▼  │
+│                                  📱 Slack      📧 Email     🎫 Jira│
+│                                  (seconds)    (minutes)    (auto)  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### Motivation
 Artemis's `autoreporter` system (`artemis/reporting/export/`) generates periodic HTML reports. However:
 
@@ -32,335 +55,514 @@ The existing `artemis/reporting/export/hooks.py` provides a basic hook mechanism
 
 ## Detailed Description
 
-### Architecture
+### End-to-End Architecture
 
 ```
-TaskResult saved (status=INTERESTING)
-        │
-        ▼
-  NotificationEngine (new Karton module)
-        │
-        ├── Evaluates rules against finding
-        │
-        ├──► SlackBackend      → Slack incoming webhook
-        ├──► TeamsBackend      → MS Teams incoming webhook
-        ├──► EmailBackend      → SMTP with HTML template
-        ├──► WebhookBackend    → Generic HTTP POST
-        └──► JiraBackend       → Jira REST API
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     NOTIFICATION SYSTEM ARCHITECTURE                    │
+│                                                                         │
+│  ┌──────────────┐                                                       │
+│  │  Scanning     │                                                       │
+│  │  Modules      │                                                       │
+│  │  (Karton)     │                                                       │
+│  │               │                                                       │
+│  │  vcs ─────┐   │                                                       │
+│  │  nuclei ──┤   │                                                       │
+│  │  bruter ──┤   │                                                       │
+│  │  ...      │   │                                                       │
+│  └───────────┤───┘                                                       │
+│              │                                                           │
+│              ▼ save_task_result(status=INTERESTING)                       │
+│  ┌──────────────────┐                                                    │
+│  │   PostgreSQL      │                                                    │
+│  │   ┌────────────┐  │      ┌────────────────────────────────────────┐   │
+│  │   │ TaskResult  │  │      │      NotificationProcessor (Karton)   │   │
+│  │   │   (new!)    │──┼─────►│                                        │   │
+│  │   └────────────┘  │ poll │  1. Query new INTERESTING results      │   │
+│  │                    │      │  2. Load enabled NotificationRules     │   │
+│  │   ┌────────────┐  │      │  3. Evaluate rules against findings    │   │
+│  │   │Notification│  │◄─────│  4. Dispatch to backends               │   │
+│  │   │   Rule     │  │      │  5. Log results                        │   │
+│  │   └────────────┘  │      │                                        │   │
+│  │                    │      └───────────┬────────────────────────────┘   │
+│  │   ┌────────────┐  │                  │                                │
+│  │   │Notification│  │◄─────────────────┘ log delivery                   │
+│  │   │   Log      │  │                  │                                │
+│  │   └────────────┘  │      ┌───────────┴────────────────────────────┐   │
+│  └──────────────────┘      │          BACKEND DISPATCHERS            │   │
+│                             │                                        │   │
+│                             │  ┌─────────┐  ┌─────────┐  ┌────────┐ │   │
+│                             │  │  Slack   │  │  Teams  │  │ Email  │ │   │
+│                             │  │ Backend  │  │ Backend │  │Backend │ │   │
+│                             │  └────┬────┘  └────┬────┘  └───┬────┘ │   │
+│                             │       │            │            │      │   │
+│                             │  ┌────┴────┐  ┌────┴────┐            │   │
+│                             │  │ Webhook │  │  Jira   │            │   │
+│                             │  │ Backend │  │ Backend │            │   │
+│                             │  └────┬────┘  └────┬────┘            │   │
+│                             └───────┼────────────┼──────────────────┘   │
+│                                     │            │                      │
+└─────────────────────────────────────┼────────────┼──────────────────────┘
+                                      ▼            ▼
+                              External Services (Slack, Teams, SMTP, Jira, Webhooks)
 ```
 
-The system integrates at the point where `ArtemisBase.db.save_task_result()` stores findings (in `artemis/module_base.py`). A new Karton module consumes notification events and processes them asynchronously.
+### Notification Processing Pipeline
 
-### Component 1: Notification Rules Engine
-
-**Data model** — new tables in `artemis/db.py`:
-
-```python
-class NotificationRule(Base):
-    __tablename__ = "notification_rule"
-
-    id = Column(Integer, primary_key=True)
-    name = Column(String)
-    enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime, server_default=text("NOW()"))
-
-    # Matching criteria
-    tag_pattern = Column(String, nullable=True)          # glob pattern, e.g. "client_*"
-    severity_threshold = Column(String, nullable=True)   # "high", "medium", "low"
-    module_filter = Column(String, nullable=True)        # comma-separated module names
-    report_type_filter = Column(String, nullable=True)   # comma-separated report types
-
-    # Delivery configuration
-    channel_type = Column(String)    # "slack", "teams", "email", "webhook", "jira"
-    channel_config = Column(JSONB)   # channel-specific config (URL, API key, etc.)
-
-    # Behavior
-    mode = Column(String, default="immediate")  # "immediate" or "digest"
-    digest_schedule = Column(String, nullable=True)  # cron expression for digest mode
-    deduplicate = Column(Boolean, default=True)
-
-
-class NotificationLog(Base):
-    __tablename__ = "notification_log"
-
-    id = Column(Integer, primary_key=True)
-    rule_id = Column(Integer, ForeignKey("notification_rule.id"), index=True)
-    task_result_id = Column(String, ForeignKey("task_result.id"), index=True)
-    created_at = Column(DateTime, server_default=text("NOW()"))
-    channel_type = Column(String)
-    status = Column(String)           # "sent", "failed", "retried"
-    error_message = Column(String, nullable=True)
-    retry_count = Column(Integer, default=0)
-
-    # Deduplication key — hash of (report_type, target_normal_form)
-    dedup_key = Column(String, index=True)
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    NOTIFICATION PROCESSING FLOW                         │
+│                                                                         │
+│                        ┌─────────────────┐                              │
+│                        │  New TaskResult  │                              │
+│                        │  (INTERESTING)   │                              │
+│                        └────────┬────────┘                              │
+│                                 │                                       │
+│                                 ▼                                       │
+│                    ┌────────────────────────┐                           │
+│                    │  Load Enabled Rules    │                           │
+│                    │  from notification_rule│                           │
+│                    └────────────┬───────────┘                           │
+│                                 │                                       │
+│                    ┌────────────▼───────────┐                           │
+│              ┌─────┤  For each rule:        │                           │
+│              │     │  Does finding match?   │                           │
+│              │     └────────────────────────┘                           │
+│              │                                                          │
+│         ┌────▼────┐      ┌──────────┐                                  │
+│         │  Tag    │ NO   │  Skip    │                                  │
+│         │ match?  ├─────►│  rule    │                                  │
+│         └────┬────┘      └──────────┘                                  │
+│              │ YES                                                      │
+│         ┌────▼─────┐     ┌──────────┐                                  │
+│         │ Severity │ NO  │  Skip    │                                  │
+│         │ meets    ├────►│  rule    │                                  │
+│         │threshold?│     └──────────┘                                  │
+│         └────┬─────┘                                                   │
+│              │ YES                                                      │
+│         ┌────▼─────┐     ┌──────────┐                                  │
+│         │ Module   │ NO  │  Skip    │                                  │
+│         │ in       ├────►│  rule    │                                  │
+│         │ filter?  │     └──────────┘                                  │
+│         └────┬─────┘                                                   │
+│              │ YES                                                      │
+│         ┌────▼──────────┐                                              │
+│         │  Check dedup  │                                              │
+│         │  key in log   │                                              │
+│         └────┬──────────┘                                              │
+│              │                                                          │
+│      ┌───────┴───────┐                                                  │
+│      │               │                                                  │
+│   Already         New finding                                           │
+│   notified            │                                                 │
+│      │          ┌─────▼─────────┐                                       │
+│      ▼          │  Mode?        │                                       │
+│   [Skip]        └──┬────────┬──┘                                       │
+│                    │        │                                            │
+│              Immediate   Digest                                         │
+│                    │        │                                            │
+│                    ▼        ▼                                            │
+│              ┌─────────┐ ┌──────────┐                                   │
+│              │  Send   │ │ Queue for│                                   │
+│              │  NOW    │ │ digest   │                                   │
+│              │         │ │ batch    │                                   │
+│              └────┬────┘ └──────────┘                                   │
+│                   │                                                     │
+│              ┌────▼──────────┐                                          │
+│              │  Log result   │                                          │
+│              │  (sent/failed)│                                          │
+│              └────┬──────────┘                                          │
+│                   │                                                     │
+│            ┌──────┴──────┐                                              │
+│            │             │                                              │
+│          Success      Failed                                            │
+│            │             │                                              │
+│            ▼             ▼                                              │
+│      [Log: sent]   [Schedule retry]                                     │
+│                    1m → 5m → 30m → 2h                                   │
+│                    (max 5 retries)                                       │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Rule evaluation logic:**
+### Component 1: Database Schema
 
-```python
-def matches_rule(finding: TaskResult, rule: NotificationRule) -> bool:
-    if rule.tag_pattern and not fnmatch(finding.tag, rule.tag_pattern):
-        return False
-    if rule.severity_threshold:
-        finding_severity = get_severity_for_task_result(finding)
-        if not severity_meets_threshold(finding_severity, rule.severity_threshold):
-            return False
-    if rule.module_filter:
-        allowed = rule.module_filter.split(",")
-        if finding.receiver not in allowed:
-            return False
-    return True
+**Entity Relationship Diagram:**
+
+```
+┌──────────────────────┐         ┌──────────────────────┐
+│   NotificationRule   │         │   NotificationLog    │
+├──────────────────────┤         ├──────────────────────┤
+│ id (PK)              │◄───┐    │ id (PK)              │
+│ name                 │    │    │ rule_id (FK) ────────│───►
+│ enabled              │    │    │ task_result_id (FK)   │───► TaskResult
+│ created_at           │    │    │ created_at            │
+│                      │    │    │ channel_type          │
+│ tag_pattern          │    │    │ status                │
+│ severity_threshold   │    └────│ (sent/failed/retried) │
+│ module_filter        │         │ error_message         │
+│ report_type_filter   │         │ retry_count           │
+│                      │         │ dedup_key             │
+│ channel_type         │         └──────────────────────┘
+│ channel_config (JSONB)│
+│                      │         ┌──────────────────────┐
+│ mode                 │         │   DigestQueue        │
+│ (immediate/digest)   │         ├──────────────────────┤
+│ digest_schedule      │         │ id (PK)              │
+│ deduplicate          │         │ rule_id (FK) ────────│───►
+└──────────────────────┘         │ task_result_id (FK)  │
+                                 │ queued_at            │
+                                 │ processed            │
+                                 └──────────────────────┘
 ```
 
-### Component 2: Notification Backends
+### Component 2: Backend Interface and Implementations
 
-Each backend implements a common interface:
-
-```python
-class NotificationBackend(ABC):
-    @abstractmethod
-    def send(self, finding: TaskResult, rule: NotificationRule) -> bool:
-        """Send a notification. Returns True on success."""
-        pass
-
-    @abstractmethod
-    def send_digest(self, findings: List[TaskResult], rule: NotificationRule) -> bool:
-        """Send a digest notification. Returns True on success."""
-        pass
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    NOTIFICATION BACKEND INTERFACE                        │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  NotificationBackend (ABC)                                        │  │
+│  │  ├── send(finding, rule) → bool                                   │  │
+│  │  └── send_digest(findings[], rule) → bool                         │  │
+│  └───────────────────────────┬───────────────────────────────────────┘  │
+│                              │                                          │
+│         ┌────────────────────┼────────────────────┐                     │
+│         │                    │                    │                     │
+│         ▼                    ▼                    ▼                     │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐               │
+│  │ SlackBackend │   │ TeamsBackend │   │ EmailBackend │               │
+│  ├──────────────┤   ├──────────────┤   ├──────────────┤               │
+│  │ Incoming     │   │ Incoming     │   │ SMTP         │               │
+│  │ Webhook URL  │   │ Webhook URL  │   │ host/port/TLS│               │
+│  │              │   │              │   │              │               │
+│  │ Block Kit    │   │ Adaptive     │   │ HTML Jinja2  │               │
+│  │ messages     │   │ Cards        │   │ templates    │               │
+│  │              │   │              │   │ (reuse       │               │
+│  │ Color-coded  │   │ Severity     │   │  existing)   │               │
+│  │ by severity  │   │ icons        │   │              │               │
+│  └──────────────┘   └──────────────┘   └──────────────┘               │
+│                                                                         │
+│         ┌────────────────────┬────────────────────┐                     │
+│         ▼                    ▼                                          │
+│  ┌──────────────┐   ┌──────────────┐                                   │
+│  │WebhookBackend│   │ JiraBackend  │                                   │
+│  ├──────────────┤   ├──────────────┤                                   │
+│  │ Custom URL   │   │ Jira REST API│                                   │
+│  │ Custom hdrs  │   │ v2/v3        │                                   │
+│  │              │   │              │                                   │
+│  │ JSON payload │   │ Auto-create  │                                   │
+│  │ with schema  │   │ issues       │                                   │
+│  │              │   │              │                                   │
+│  │ Retry with   │   │ Dedup via    │                                   │
+│  │ exp backoff  │   │ JQL search   │                                   │
+│  └──────────────┘   └──────────────┘                                   │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Slack Backend:**
-- Uses Slack Incoming Webhooks (no OAuth needed, simple setup)
-- Sends a rich Block Kit message with severity color coding, target URL, finding details, and a link back to the Artemis UI
-- Digest mode sends a summary message with counts by severity
+### Component 3: Notification Message Formats
 
-**Microsoft Teams Backend:**
-- Uses Incoming Webhook connector (similar to Slack)
-- Sends Adaptive Card format with severity, target, and details
-- Digest mode sends a table-format summary
+**Slack Message (Block Kit):**
 
-**Email Backend:**
-- Uses SMTP (configurable host/port/TLS)
-- Reuses Artemis's existing Jinja2 email template infrastructure from `artemis/reporting/base/templating.py`
-- HTML email with finding details, styled consistently with existing report emails
-- Digest mode sends a daily/weekly summary email
-
-**Generic Webhook Backend:**
-- HTTP POST to a user-configured URL
-- JSON payload with standardized schema:
-  ```json
-  {
-    "event": "new_finding",
-    "timestamp": "2026-...",
-    "finding": {
-      "id": "...",
-      "target": "...",
-      "report_type": "...",
-      "severity": "high",
-      "status_reason": "...",
-      "tag": "..."
-    },
-    "artemis_url": "https://artemis.example.com/task/..."
-  }
-  ```
-- Supports custom headers (for API keys)
-- Configurable retry with exponential backoff
-
-**Jira Backend:**
-- Creates issues via Jira REST API v2/v3
-- Configurable project key, issue type, priority mapping
-- Includes finding details in the description
-- **Deduplication:** Before creating, searches for existing issues with the same dedup key in a custom field — updates instead of creating duplicates
-- When a finding is resolved in Artemis (if lifecycle management is also implemented), optionally transitions the Jira issue
-
-### Component 3: Notification Processing Pipeline
-
-**Karton module:** `NotificationProcessor`
-
-```python
-class NotificationProcessor(ArtemisBase):
-    identity = "notification_processor"
-
-    # Runs on a timer, not on task binds
-    def loop(self):
-        while True:
-            # Check for new INTERESTING task results since last check
-            new_findings = self.get_new_findings_since_last_check()
-
-            for finding in new_findings:
-                for rule in self.get_enabled_rules():
-                    if matches_rule(finding, rule):
-                        self.process_notification(finding, rule)
-
-            # Process digest rules
-            self.process_pending_digests()
-
-            time.sleep(Config.Notifications.POLL_INTERVAL_SECONDS)
+```
+┌─────────────────────────────────────────────────────────┐
+│ 🔴  HIGH SEVERITY FINDING                     Artemis   │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  Target:   https://example.com/.git/config              │
+│  Type:     Exposed Version Control Folder               │
+│  Module:   vcs                                          │
+│  Tag:      client_production                            │
+│  Found:    2026-03-14 09:23 UTC                         │
+│                                                         │
+│  Found exposed .git repository with potential           │
+│  credentials in the remote URL.                         │
+│                                                         │
+│  ┌─────────────────┐  ┌─────────────────────────┐      │
+│  │ View in Artemis │  │ Mark as False Positive  │      │
+│  └─────────────────┘  └─────────────────────────┘      │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**Alternative approach:** Instead of polling, inject a notification hook directly into `ArtemisBase.db.save_task_result()` that publishes to a Redis pub/sub channel. The `NotificationProcessor` subscribes and processes in near real-time.
+**Digest Email:**
 
-**Deduplication:**
-- Before sending, compute a dedup key: `hash(report_type + target_normal_form)`
-- Check `NotificationLog` for recent entries with the same dedup key and rule
-- Skip if already notified within a configurable window (default: 7 days)
+```
+┌─────────────────────────────────────────────────────────┐
+│ Subject: [Artemis] Weekly Digest — 12 new (3 Critical)  │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  Weekly Scan Summary for tag "client_production"        │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │ Severity   │ Count  │ New This Week │  Trend    │    │
+│  ├────────────┼────────┼───────────────┼───────────┤    │
+│  │ 🔴 High   │   8    │     3         │   ↗ +2    │    │
+│  │ 🟡 Medium │  15    │     5         │   ↗ +1    │    │
+│  │ 🔵 Low    │  22    │     4         │   → 0     │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                         │
+│  Top New Findings:                                      │
+│  1. 🔴 Exposed .git with creds — example.com           │
+│  2. 🔴 SQL injection — app.example.com/api/v1           │
+│  3. 🔴 Weak admin password — admin.site.org             │
+│  4. 🟡 Outdated WordPress — blog.example.com            │
+│  5. 🟡 CORS misconfiguration — api.example.com          │
+│                                                         │
+│  [View All Findings in Artemis ►]                       │
+└─────────────────────────────────────────────────────────┘
+```
 
-**Retry logic:**
-- On failure, log the error and schedule a retry
-- Exponential backoff: 1 min, 5 min, 30 min, 2 hours
-- Maximum 5 retries before marking as permanently failed
+**Jira Issue:**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  PROJECT: SEC  │  Type: Bug  │  Priority: 🔴 Critical  │
+├─────────────────────────────────────────────────────────┤
+│  Title: [Artemis] Exposed .git — example.com            │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  Description:                                           │
+│  Artemis vulnerability scanner detected:                │
+│                                                         │
+│  | Field    | Value                              |      │
+│  |----------|-------------------------------------|     │
+│  | Target   | https://example.com/.git/config    |      │
+│  | Type     | Exposed Version Control Folder     |      │
+│  | Severity | HIGH                               |      │
+│  | Module   | vcs                                |      │
+│  | Tag      | client_production                  |      │
+│  | Found    | 2026-03-14 09:23 UTC               |      │
+│                                                         │
+│  [Artemis Link: https://artemis.example.com/task/...]   │
+│                                                         │
+│  Labels: artemis, security, auto-generated              │
+│  Custom Field (dedup_key): a1b2c3d4e5...                │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Webhook JSON Payload:**
+
+```json
+{
+  "event": "new_finding",
+  "timestamp": "2026-03-14T09:23:45Z",
+  "finding": {
+    "id": "task-uuid-here",
+    "target": "https://example.com/.git/config",
+    "report_type": "exposed_version_control_folder",
+    "severity": "high",
+    "status_reason": "Found exposed .git repository",
+    "module": "vcs",
+    "tag": "client_production"
+  },
+  "artemis_url": "https://artemis.example.com/task/task-uuid-here"
+}
+```
 
 ### Component 4: Configuration UI
 
-New pages accessible from the main navigation:
+**Rules Management Page:**
 
-**Notification Rules Page (`/notifications/rules`):**
-- List of all rules with enable/disable toggle
-- Create/edit form:
-  - Rule name
-  - Tag pattern (with autocomplete from existing tags)
-  - Severity threshold (dropdown: High, Medium, Low)
-  - Module filter (multi-select from available modules)
-  - Channel type (radio: Slack / Teams / Email / Webhook / Jira)
-  - Channel-specific configuration (dynamic form based on channel type)
-  - Mode: Immediate / Digest (with schedule picker for digest)
-  - Test button: sends a test notification
-
-**Notification History Page (`/notifications/history`):**
-- Filterable log of all sent notifications
-- Shows: timestamp, rule name, finding target, channel, status
-- Click to see full notification payload and any error details
-
-### Component 5: Docker Compose Integration
-
-New service in `docker-compose.yaml`:
-
-```yaml
-notification-processor:
-  <<: *artemis-build-or-image
-  <<: *logging
-  restart: always
-  depends_on:
-    - postgres
-    - redis
-  env_file: .env
-  command: python3 -m artemis.notification_processor
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Notification Rules                                    [+ New Rule]  │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌────┬──────────────────────┬────────┬──────────┬────────┬───────┐ │
+│  │ On │ Rule Name            │Channel │ Severity │ Tag    │Actions│ │
+│  ├────┼──────────────────────┼────────┼──────────┼────────┼───────┤ │
+│  │ ✅ │ Critical alerts      │ Slack  │ >= High  │ *      │ ✏️ 🗑️│ │
+│  │ ✅ │ Client A weekly      │ Email  │ >= Low   │client_a│ ✏️ 🗑️│ │
+│  │ ❌ │ Security team Jira   │ Jira   │ >= Med   │ *      │ ✏️ 🗑️│ │
+│  │ ✅ │ SIEM integration     │Webhook │ >= High  │ *      │ ✏️ 🗑️│ │
+│  │ ✅ │ DNS team alerts      │ Teams  │ >= Med   │ dns_*  │ ✏️ 🗑️│ │
+│  └────┴──────────────────────┴────────┴──────────┴────────┴───────┘ │
+│                                                                      │
+├──── Create / Edit Rule ─────────────────────────────────────────────┤
+│                                                                      │
+│  Rule Name: [Critical Slack Alerts          ]                        │
+│                                                                      │
+│  ┌─ Matching Criteria ──────────────────────────────────────────┐   │
+│  │ Tag Pattern:     [client_*     ] (glob, leave empty for all) │   │
+│  │ Min Severity:    [High      ▼]                               │   │
+│  │ Module Filter:   [☑ vcs ☑ nuclei ☐ bruter ☐ humble ...]     │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌─ Delivery ──────────────────────────────────────────────────┐    │
+│  │ Channel:  (●) Slack  ( ) Teams  ( ) Email  ( ) Webhook      │    │
+│  │                                                              │    │
+│  │ Webhook URL: [https://hooks.slack.com/services/T.../B...]    │    │
+│  │                                                              │    │
+│  │ Mode: (●) Immediate    ( ) Digest                            │    │
+│  │       Deduplication: [☑] (7 day window)                      │    │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  [Save Rule]  [Test Notification]  [Cancel]                          │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-New configuration variables in `artemis/config.py`:
+**Notification History Page:**
 
-```python
-class Notifications:
-    ENABLE_NOTIFICATIONS = get_config("ENABLE_NOTIFICATIONS", default=False, cast=bool)
-    POLL_INTERVAL_SECONDS = get_config("NOTIFICATION_POLL_INTERVAL_SECONDS", default=60, cast=int)
-    SMTP_HOST = get_config("NOTIFICATION_SMTP_HOST", default="")
-    SMTP_PORT = get_config("NOTIFICATION_SMTP_PORT", default=587, cast=int)
-    SMTP_USERNAME = get_config("NOTIFICATION_SMTP_USERNAME", default="")
-    SMTP_PASSWORD = get_config("NOTIFICATION_SMTP_PASSWORD", default="")
-    SMTP_FROM = get_config("NOTIFICATION_SMTP_FROM", default="")
 ```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Notification History                [Filter: All ▼] [Search ____]   │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────┬───────────────────┬─────────┬────────┬────────┬─────┐ │
+│  │ Time     │ Target            │ Channel │ Rule   │ Status │ ↻   │ │
+│  ├──────────┼───────────────────┼─────────┼────────┼────────┼─────┤ │
+│  │ 09:23:47 │ example.com/.git  │ 📱Slack │ Crit.  │ ✅ Sent│     │ │
+│  │ 09:23:48 │ example.com/.git  │ 📧Email │ Weekly │ ✅ Sent│     │ │
+│  │ 09:15:12 │ app.test.com/api  │ 🎫Jira  │ SecTeam│ ❌ Fail│ [↻] │ │
+│  │ 08:45:00 │ blog.org/wp-admin │ 📱Slack │ Crit.  │ ✅ Sent│     │ │
+│  │ 08:30:15 │ cdn.site.com      │ 🔗Hook  │ SIEM   │ ✅ Sent│     │ │
+│  └──────────┴───────────────────┴─────────┴────────┴────────┴─────┘ │
+│                                                                      │
+│  ◄ 1  2  3  4  5 ►                         Showing 1-25 of 1,203    │
+│                                                                      │
+│  Summary: 1,180 sent (98.1%) │ 18 failed (1.5%) │ 5 retrying (0.4%) │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Component 5: Docker & Configuration Integration
+
+**Docker Compose Addition:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  docker-compose.yaml — new service                              │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ notification-processor:                                  │    │
+│  │   image: certpl/artemis:latest                           │    │
+│  │   restart: always                                        │    │
+│  │   depends_on: [postgres, redis]                          │    │
+│  │   command: python3 -m artemis.notification_processor     │    │
+│  │   env_file: .env                                         │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  Existing Services:                                             │
+│  ┌────────┐ ┌────────┐ ┌────────┐ ┌─────────────┐             │
+│  │postgres│ │ redis  │ │  web   │ │autoreporter │             │
+│  └────────┘ └────────┘ └────────┘ └─────────────┘             │
+│       ▲          ▲          ▲                                   │
+│       │          │          │                                   │
+│       └──────────┴──────────┴──────────┐                       │
+│                                        │                       │
+│  ┌─────────────────────────────────────┴───┐                   │
+│  │     notification-processor (NEW)        │                   │
+│  └─────────────────────────────────────────┘                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Configuration Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_NOTIFICATIONS` | `false` | Master switch for notification system |
+| `NOTIFICATION_POLL_INTERVAL_SECONDS` | `60` | How often to check for new findings |
+| `NOTIFICATION_SMTP_HOST` | `""` | SMTP server for email notifications |
+| `NOTIFICATION_SMTP_PORT` | `587` | SMTP port |
+| `NOTIFICATION_SMTP_USERNAME` | `""` | SMTP authentication |
+| `NOTIFICATION_SMTP_PASSWORD` | `""` | SMTP password |
+| `NOTIFICATION_SMTP_FROM` | `""` | Sender email address |
+| `NOTIFICATION_DEDUP_WINDOW_DAYS` | `7` | Deduplication window |
+| `NOTIFICATION_MAX_RETRIES` | `5` | Maximum retry attempts |
+| `NOTIFICATION_ENCRYPTION_KEY` | `""` | Fernet key for channel_config encryption |
 
 ---
 
 ## Timeline and Deliverables
 
-### Community Bonding Period (May 8 - June 1)
-- Study Artemis's Karton task flow and `ArtemisBase` module pattern
-- Set up test environments for Slack, Email (MailHog), and Jira (local instance)
-- Design the notification payload schema
-- Draft the rules engine matching logic and get mentor feedback
-- Submit a small PR (e.g., documentation improvement)
+### Gantt Chart
+
+```
+        May         June           July           August         Sep
+       Week: 1 2 3 4 1 2 3 4 5 6 7 8 9 10 11 12  1
+             ├─┤                                      Community Bonding
+             │CB│
+                   ├─────────┤                        Phase 1: Core + Slack/Email
+                   │DB│Rules│Slack│Email│UI│
+                             ├───┤                    ◆ Midterm Eval
+                                  ├─────────┤         Phase 2: More backends
+                                  │Hook│Teams│Jira│Digest│Dedup│
+                                              ├──────┤Phase 3: History + Polish
+                                              │Hist│Docker│Test│Doc│
+                                                     ├┤ Final Eval
+
+Legend: CB=Community Bonding, ◆=Evaluation
+```
 
 ### Phase 1: Weeks 1-4 (June 2 - June 29)
 
 **Deliverable: Rules engine, Slack and Email backends, basic UI**
 
-| Week | Tasks |
-|------|-------|
-| 1 | Implement `NotificationRule` and `NotificationLog` models; Alembic migration; DB methods |
-| 2 | Build the rules evaluation engine; implement Slack backend with Block Kit messages |
-| 3 | Implement Email backend with HTML templates (reusing existing template infrastructure) |
-| 4 | Build notification rules configuration UI; add test notification functionality |
+| Week | Tasks | Deliverable | Hours |
+|------|-------|-------------|-------|
+| 1 | `NotificationRule` + `NotificationLog` models; Alembic migration; DB CRUD | Schema + migration | 30 |
+| 2 | Rules evaluation engine; Slack backend with Block Kit | Working Slack alerts | 30 |
+| 3 | Email backend with Jinja2 templates (reuse existing infra) | Working email alerts | 30 |
+| 4 | Rules config UI; test notification button | Management interface | 35 |
 
 ### Midterm Evaluation (June 30 - July 4)
-
-**Expected state:** Working notification system where operators can create rules to get Slack and Email alerts for high-severity findings. Rules UI for configuration and a test button. Notification log tracking delivery status.
 
 ### Phase 2: Weeks 5-8 (July 5 - August 3)
 
 **Deliverable: Webhook, Teams, Jira backends; digest mode; deduplication**
 
-| Week | Tasks |
-|------|-------|
-| 5 | Implement generic Webhook backend; implement Microsoft Teams backend |
-| 6 | Implement Jira backend with issue creation, deduplication, and update |
-| 7 | Build digest mode: accumulate findings, send on schedule (cron-based) |
-| 8 | Implement deduplication logic; retry mechanism with exponential backoff |
+| Week | Tasks | Deliverable | Hours |
+|------|-------|-------------|-------|
+| 5 | Generic Webhook backend; Microsoft Teams backend | 2 more channels | 30 |
+| 6 | Jira backend with issue creation + dedup via JQL | Jira integration | 35 |
+| 7 | Digest mode: accumulate findings, cron-based batch send | Digest notifications | 30 |
+| 8 | Deduplication logic; retry with exponential backoff | Robust delivery | 30 |
 
 ### Phase 3: Weeks 9-12 (August 4 - August 31)
 
-**Deliverable: Notification history, Docker integration, testing, documentation**
+| Week | Tasks | Deliverable | Hours |
+|------|-------|-------------|-------|
+| 9 | Notification history UI with filtering | History dashboard | 30 |
+| 10 | Docker Compose integration; config vars; encryption | Production-ready | 25 |
+| 11 | Unit tests (mocked APIs); integration tests (MailHog) | Test coverage | 30 |
+| 12 | Setup guides per channel; admin guide; architecture docs | Documentation | 25 |
 
-| Week | Tasks |
-|------|-------|
-| 9 | Build notification history UI with filtering and search |
-| 10 | Docker Compose integration; add configuration to `config.py`; environment variable docs |
-| 11 | Comprehensive testing: unit tests with mocked APIs, integration tests with MailHog |
-| 12 | Documentation: setup guide for each channel, admin guide, architecture docs |
+---
 
-### Final Evaluation (September 1 - September 8)
+## Effort Breakdown
+
+```
+                    Effort Distribution (350 hours)
+
+  ┌────────────────────────────────────────────────────────┐
+  │                                                        │
+  │  DB Schema & Rules Engine  █████░░░░░░░░░░░  45h (13%)│
+  │  Slack Backend             ████░░░░░░░░░░░░░  30h  (9%)│
+  │  Email Backend             ████░░░░░░░░░░░░░  30h  (9%)│
+  │  Webhook Backend           ███░░░░░░░░░░░░░░  20h  (6%)│
+  │  Teams Backend             ███░░░░░░░░░░░░░░  20h  (6%)│
+  │  Jira Backend              █████░░░░░░░░░░░░  35h (10%)│
+  │  Digest + Deduplication    █████░░░░░░░░░░░░  40h (11%)│
+  │  Configuration UI          █████░░░░░░░░░░░░  40h (11%)│
+  │  Notification History UI   ████░░░░░░░░░░░░░  30h  (9%)│
+  │  Docker + Config           ███░░░░░░░░░░░░░░  20h  (6%)│
+  │  Testing                   ████░░░░░░░░░░░░░  25h  (7%)│
+  │  Documentation             ██░░░░░░░░░░░░░░░  15h  (4%)│
+  │                                                        │
+  └────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Technical Challenges and Mitigations
 
-| Challenge | Mitigation |
-|-----------|------------|
-| External API rate limits (Slack, Jira) | Implement per-channel rate limiting with token bucket algorithm |
-| Notification storms on large scan completion | Deduplication + digest mode + configurable cooldown period |
-| Sensitive channel configs (API keys) in DB | Encrypt `channel_config` JSONB values using Fernet symmetric encryption |
-| Testing external integrations in CI | Use mock servers (MailHog for SMTP, WireMock for HTTP) in test environment |
-| Jira dedup requires searching for existing issues | Use JQL query with custom field; cache results to reduce API calls |
-
----
-
-## Notification Message Examples
-
-### Slack Message (Block Kit)
-
-```
-🔴 High Severity Finding — Artemis
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Target: https://example.com/.git/config
-Type: Exposed Version Control Folder
-Tag: client_production
-Module: vcs
-
-Found exposed .git repository with potential
-credentials.
-
-[View in Artemis]  [Mark as False Positive]
-```
-
-### Digest Email
-
-```
-Subject: [Artemis] Weekly Digest — 12 new findings (3 High)
-
-This week's scan summary for tag "client_production":
-• 3 High severity findings (2 new)
-• 5 Medium severity findings (1 new)
-• 4 Low severity findings (all new)
-
-Top findings:
-1. 🔴 Exposed .git with credentials — example.com
-2. 🔴 SQL injection detected — app.example.com/api/v1
-3. 🟡 Outdated WordPress plugin — blog.example.com
-...
-
-View all findings: https://artemis.example.com/?tag=client_production
-```
+| Challenge | Risk | Mitigation |
+|-----------|------|------------|
+| External API rate limits (Slack, Jira) | Medium | Per-channel rate limiting with token bucket algorithm |
+| Notification storms on large scan completion | High | Deduplication + digest mode + configurable cooldown period |
+| Sensitive channel configs (API keys) in DB | Medium | Encrypt `channel_config` JSONB using Fernet symmetric encryption |
+| Testing external integrations in CI | Medium | Mock servers (MailHog for SMTP, WireMock for HTTP) in test environment |
+| Jira dedup requires searching for existing issues | Low | JQL query with custom field; cache results to reduce API calls |
+| Polling-based may miss findings during restart | Low | Track last-processed timestamp in Redis; catch up on restart |
 
 ---
 

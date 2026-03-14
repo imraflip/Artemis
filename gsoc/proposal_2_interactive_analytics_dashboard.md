@@ -18,6 +18,46 @@ Interactive Analytics Dashboard with Trend Analysis
 ### Synopsis
 Artemis's current web interface is a functional but static table-based view. When CSIRT teams manage thousands of scanned domains, they need visual trend analysis, comparative views, and actionable analytics — not just raw data tables. This project replaces the static dashboard with an interactive, chart-based analytics UI backed by efficient SQL aggregation queries, enabling operators to understand vulnerability trends, compare scan runs, and assess organizational risk posture at a glance.
 
+### Current vs. Proposed Dashboard
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  CURRENT: Static table with minimal insight                       │
+│                                                                   │
+│  ┌───────────────────────────────────────────────────────────┐    │
+│  │ Target         │ Tag      │ Created At     │ Actions      │    │
+│  │ example.com    │ client_a │ 2026-03-01     │ [View]       │    │
+│  │ test.org       │ client_b │ 2026-03-02     │ [View]       │    │
+│  │ app.io         │ client_c │ 2026-03-03     │ [View]       │    │
+│  │ ...            │ ...      │ ...            │              │    │
+│  └───────────────────────────────────────────────────────────┘    │
+│  No charts. No trends. No comparisons. Just rows.                 │
+└───────────────────────────────────────────────────────────────────┘
+
+                              │
+                              ▼
+
+┌───────────────────────────────────────────────────────────────────┐
+│  PROPOSED: Interactive analytics with visual insights             │
+│                                                                   │
+│  ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐ ┌──────────────────┐   │
+│  │ 1,234 │ │ 5,678 │ │  234  │ │  89   │ │ Trend ↗ +12%     │   │
+│  │Analyses│ │Findings│ │ High │ │Pending│ │ vs last month    │   │
+│  └───────┘ └───────┘ └───────┘ └───────┘ └──────────────────┘   │
+│  ┌────────────────────────────┐ ┌────────────────────────────┐   │
+│  │  📈 Trend Chart           │ │  🍩 Severity Distribution  │   │
+│  │  ▄   ▄▄                   │ │    ██ High: 234 (15%)      │   │
+│  │ ██▄▄████▄▄   ▄            │ │   ████ Med: 890 (55%)     │   │
+│  │ ████████████▄██▄           │ │  ██████ Low: 480 (30%)    │   │
+│  └────────────────────────────┘ └────────────────────────────┘   │
+│  ┌───────────────────────────────────────────────────────────┐   │
+│  │  📊 Risk by Organization  │ Findings │ Trend │ Score      │   │
+│  │  client_a                 │    67    │  ↗ +5 │ ████ 8.2   │   │
+│  │  client_b                 │    23    │  ↘ -2 │ ██   4.1   │   │
+│  └───────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────┘
+```
+
 ### Motivation
 The current Artemis dashboard (`templates/index.jinja2`) renders a paginated table of analyses with minimal filtering. The task results view (`templates/task_list.jinja2`) offers basic search via PostgreSQL fulltext (`TSVector`). For a tool that scans hundreds of thousands of domains:
 
@@ -33,53 +73,81 @@ These gaps make it difficult for CSIRT teams to prioritize their work and demons
 
 ## Detailed Description
 
-### Architecture
+### System Architecture
 
-The implementation stays within Artemis's existing technology choices:
-- **Backend:** FastAPI with new `/api/stats/*` endpoints
-- **Database:** PostgreSQL with SQLAlchemy — leveraging SQL aggregation queries
-- **Frontend:** Jinja2 templates + Bootstrap + **Chart.js** (lightweight, no heavy framework needed)
-- **Caching:** Redis for expensive aggregation query results (using existing `RedisCache` from `artemis/redis_cache.py`)
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      ANALYTICS ARCHITECTURE                         │
+│                                                                     │
+│  ┌───────────┐     ┌──────────────┐     ┌────────────────────────┐ │
+│  │ PostgreSQL│     │   FastAPI     │     │   Browser (Client)     │ │
+│  │           │     │              │     │                        │ │
+│  │ TaskResult├────►│ /api/stats/  ├────►│  Chart.js renders      │ │
+│  │ Analysis  │     │ findings-    │     │  interactive charts    │ │
+│  │ Tag       │     │ over-time    │     │                        │ │
+│  │           │     │              │     │  Jinja2 provides       │ │
+│  │ Aggregate │     │ /api/stats/  │     │  page structure        │ │
+│  │ Queries   │     │ tags-summary │     │                        │ │
+│  │ (GROUP BY,│     │              │     │  Bootstrap handles     │ │
+│  │  FILTER)  │     │ /api/stats/  │     │  layout & responsive   │ │
+│  │           │     │ modules      │     │                        │ │
+│  └─────┬─────┘     │              │     └────────────────────────┘ │
+│        │           │ /api/stats/  │                                 │
+│        │           │ comparison   │                                 │
+│        ▼           └──────┬───────┘                                 │
+│  ┌───────────┐           │                                         │
+│  │   Redis   │◄──────────┘                                         │
+│  │  Cache    │  TTL-based caching                                  │
+│  │  (5 min)  │  for expensive queries                              │
+│  └───────────┘                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow for Analytics
+
+```
+User opens           Jinja2 renders         JS fetches             Charts
+dashboard            page skeleton          API data               render
+    │                     │                     │                     │
+    ▼                     ▼                     ▼                     ▼
+┌────────┐          ┌──────────┐          ┌──────────┐          ┌────────┐
+│GET /   │─────────►│ HTML with │─────────►│GET /api/ │─────────►│Chart.js│
+│        │          │ empty     │          │stats/*   │          │draws   │
+│        │          │ chart     │          │          │          │charts  │
+│        │          │ containers│          │Returns   │          │into    │
+│        │          │           │          │JSON data │          │<canvas>│
+└────────┘          └──────────┘          └────┬─────┘          └────────┘
+                                               │
+                                    ┌──────────┴──────────┐
+                                    │                     │
+                               Cache HIT            Cache MISS
+                                    │                     │
+                                    ▼                     ▼
+                              ┌──────────┐          ┌──────────┐
+                              │  Redis   │          │PostgreSQL│
+                              │  Return  │          │ Execute  │
+                              │  cached  │          │ aggregate│
+                              │  JSON    │          │ query    │
+                              └──────────┘          └────┬─────┘
+                                                         │
+                                                    Store in Redis
+                                                    with TTL=300s
+```
 
 ### Component 1: Analytics API Endpoints
 
 New routes in a dedicated `artemis/analytics_api.py` module, registered on the FastAPI app:
 
-```python
-# Trend data
-GET /api/stats/findings-over-time
-    ?interval=day|week|month
-    &tag=optional_tag
-    &severity=optional_severity
-    → Returns: [{date, count_new, count_resolved, count_total}]
+**API Endpoint Map:**
 
-# Per-tag breakdown
-GET /api/stats/tags-summary
-    → Returns: [{tag, total_findings, high_count, medium_count, low_count,
-                  newest_finding_date, oldest_unresolved_date}]
-
-# Module performance
-GET /api/stats/modules
-    → Returns: [{module_name, total_findings, interesting_count, error_count,
-                  avg_processing_time}]
-
-# Comparison between two time ranges or tags
-GET /api/stats/comparison
-    ?tag_a=tag1&tag_b=tag2
-    OR ?date_from_a=...&date_to_a=...&date_from_b=...&date_to_b=...
-    → Returns: {new_findings, resolved_findings, persistent_findings,
-                findings_only_in_a, findings_only_in_b}
-
-# Severity distribution
-GET /api/stats/severity-distribution
-    ?tag=optional_tag
-    → Returns: [{severity, count}]
-
-# Top vulnerable targets
-GET /api/stats/top-targets
-    ?limit=10&tag=optional_tag
-    → Returns: [{target, finding_count, highest_severity}]
-```
+| Endpoint | Method | Query Params | Returns | Cache TTL |
+|----------|--------|-------------|---------|-----------|
+| `/api/stats/findings-over-time` | GET | `interval`, `tag`, `severity` | `[{date, new, resolved, total}]` | 5 min |
+| `/api/stats/tags-summary` | GET | — | `[{tag, total, high, med, low}]` | 5 min |
+| `/api/stats/modules` | GET | — | `[{module, findings, errors}]` | 5 min |
+| `/api/stats/comparison` | GET | `tag_a`, `tag_b` or date ranges | `{new, resolved, persistent}` | 2 min |
+| `/api/stats/severity-distribution` | GET | `tag` | `[{severity, count}]` | 5 min |
+| `/api/stats/top-targets` | GET | `limit`, `tag` | `[{target, count, severity}]` | 5 min |
 
 **SQL Query Design:** These endpoints use PostgreSQL aggregate functions and window functions:
 
@@ -93,6 +161,19 @@ FROM task_result
 WHERE tag = :tag AND created_at >= :since
 GROUP BY period
 ORDER BY period;
+
+-- Example: per-tag severity breakdown
+SELECT
+    tag,
+    COUNT(*) AS total,
+    COUNT(*) FILTER (WHERE result->>'severity' = 'high') AS high_count,
+    COUNT(*) FILTER (WHERE result->>'severity' = 'medium') AS medium_count,
+    COUNT(*) FILTER (WHERE result->>'severity' = 'low') AS low_count,
+    MAX(created_at) AS latest_finding
+FROM task_result
+WHERE status = 'INTERESTING'
+GROUP BY tag
+ORDER BY total DESC;
 ```
 
 For performance with large datasets, queries use:
@@ -102,99 +183,226 @@ For performance with large datasets, queries use:
 
 ### Component 2: Dashboard Redesign
 
-The main dashboard at `/` (`templates/index.jinja2`) is redesigned with multiple sections:
+**Full Dashboard Layout Mockup:**
 
-**Section 1: Overview Cards**
-- Total active analyses
-- Total findings (INTERESTING status)
-- Findings by severity (High/Medium/Low counts)
-- Pending scan tasks (reusing existing `get_num_pending_tasks`)
-
-**Section 2: Trend Chart**
-- Line chart showing findings discovered per week over the past N months
-- Stacked by severity (High = red, Medium = orange, Low = yellow)
-- Interactive: hover for details, click to filter
-
-**Section 3: Module Activity Heatmap**
-- Calendar heatmap showing which modules are active and producing findings
-- Quick identification of scanning coverage gaps
-
-**Section 4: Per-Tag Risk Table**
-- Enhanced version of the current analyses table
-- Added columns: finding count, highest severity, last scan date
-- Inline mini-sparklines showing finding trend per tag
-- Sortable by any column
-
-**Section 5: Top Findings**
-- Quick-view of the most critical unresolved findings across all tags
-
-**Implementation:** Using Chart.js loaded from CDN (or bundled), initialized from data fetched via the new API endpoints. Charts are rendered client-side with JavaScript calling the API endpoints. This approach:
-- Keeps the Jinja2 template pattern (server renders page shell, JS fetches data)
-- Avoids introducing a heavy JS framework (React/Vue)
-- Allows progressive enhancement — the page works without JS (shows tables), JS adds charts
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Artemis Analytics Dashboard                    [+ Add Targets]      │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐    │
+│  │  📊 1,234  │  │  🔍 5,678  │  │  🔴  234   │  │  ⏳   89   │    │
+│  │  Analyses  │  │  Findings  │  │  Critical  │  │  Pending   │    │
+│  │            │  │  Total     │  │  (High)    │  │  Tasks     │    │
+│  └────────────┘  └────────────┘  └────────────┘  └────────────┘    │
+│                                                                      │
+│  ┌─ Findings Over Time ──────────────────────── [1W][1M][3M][1Y] ─┐ │
+│  │  250│                                                          │ │
+│  │     │    ▄                                                     │ │
+│  │  200│   ██    ▄                                                │ │
+│  │     │   ██   ██  ▄                                             │ │
+│  │  150│   ██   ██  ██         ▄▄                                 │ │
+│  │     │   ██▄  ██  ██    ▄   ████                                │ │
+│  │  100│   ███▄ ██▄ ██   ██▄ ████▄    ▄                           │ │
+│  │     │   ████ ███ ██▄ ████ █████   ██▄                          │ │
+│  │   50│   ████ ███ ███ ████ █████▄ ████                          │ │
+│  │     │   ████ ███ ███ ████ ██████ ████▄                         │ │
+│  │    0│───████─███─███─████─██████─█████──                       │ │
+│  │     └──Jan──Feb──Mar──Apr──May──Jun──Jul──                     │ │
+│  │                                                                │ │
+│  │  Legend: ███ High  ███ Medium  ███ Low                         │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌─ Severity Distribution ────────┐  ┌─ Top Modules ──────────────┐ │
+│  │                                │  │                            │ │
+│  │        ╭────────╮              │  │  nuclei      ████████  312 │ │
+│  │      ╭─┤ HIGH   ├──╮          │  │  bruter      ██████    245 │ │
+│  │    ╭─┤ │  15%   │  ├─╮        │  │  vcs         █████     198 │ │
+│  │    │ │ ╰────────╯  │ │        │  │  wp_scanner  ████      156 │ │
+│  │    │ │  ╭───────╮  │ │        │  │  sql_inj     ███       112 │ │
+│  │    │ ├──┤MEDIUM ├──┤ │        │  │  dns_scan    ██         89 │ │
+│  │    │ │  │  55%  │  │ │        │  │  humble      █          45 │ │
+│  │    │ │  ╰───────╯  │ │        │  │  port_scan   █          34 │ │
+│  │    ╰─┤  ╭──────╮  ├─╯        │  │                            │ │
+│  │      ╰──┤ LOW  ├──╯          │  │  [Show All Modules ►]      │ │
+│  │         │  30% │              │  │                            │ │
+│  │         ╰──────╯              │  │                            │ │
+│  └────────────────────────────────┘  └────────────────────────────┘ │
+│                                                                      │
+│  ┌─ Per-Organization Risk Breakdown ──────────────── [Filter] [↕] ─┐ │
+│  │                                                                  │ │
+│  │  Tag          Total   🔴High  🟡Med   🔵Low   Trend    Last Scan │ │
+│  │  ──────────   ─────   ─────   ────    ────    ──────   ──────── │ │
+│  │  client_a       67      25     30      12     ↗ +5     2h ago   │ │
+│  │   ▁▂▃▅▇▅▃  (sparkline showing 8-week trend)                    │ │
+│  │                                                                  │ │
+│  │  client_b       45      12     20      13     ↘ -2     1d ago   │ │
+│  │   ▇▅▃▂▁▂▃  (sparkline)                                         │ │
+│  │                                                                  │ │
+│  │  client_c       23       3      8      12     → 0      3h ago   │ │
+│  │   ▃▃▃▃▃▃▃  (sparkline)                                         │ │
+│  │                                                                  │ │
+│  │  ◄ 1  2  3 ►                             Showing 1-10 of 45     │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌─ Top Critical Findings ─────────────────────────────────────────┐ │
+│  │  🔴 Exposed .git with creds    example.com       vcs    3d ago  │ │
+│  │  🔴 SQL injection              app.test.com      nuclei 1d ago  │ │
+│  │  🔴 Weak admin password        admin.site.org    bruter 5h ago  │ │
+│  │  [View All Findings ►]                                          │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ### Component 3: Comparison View
 
-A new page at `/compare` that allows operators to:
+**Comparison Page Mockup:**
 
-1. **Select two tags** (e.g., "client_A" vs "client_B") or two time ranges
-2. **See a side-by-side diff** showing:
-   - Findings present in A but not B (new findings)
-   - Findings present in B but not A (resolved findings)
-   - Findings present in both (persistent findings)
-3. **Venn diagram visualization** using Chart.js
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Artemis — Compare                                    [Dashboard]    │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Compare: [Tag ▼] client_a  vs.  [Tag ▼] client_b    [Compare]     │
+│           OR                                                         │
+│           [Date Range] Mar 1-7  vs.  [Date Range] Mar 8-14           │
+│                                                                      │
+│  ┌─ Comparison Summary ────────────────────────────────────────────┐ │
+│  │                                                                  │ │
+│  │          client_a              BOTH             client_b         │ │
+│  │        ┌──────────┐      ┌──────────┐      ┌──────────┐        │ │
+│  │        │          │      │          │      │          │        │ │
+│  │        │    23    │      │    34    │      │    11    │        │ │
+│  │        │  unique  │      │  shared  │      │  unique  │        │ │
+│  │        │ findings │      │ findings │      │ findings │        │ │
+│  │        │          │      │          │      │          │        │ │
+│  │        └──────────┘      └──────────┘      └──────────┘        │ │
+│  │                                                                  │ │
+│  │  ┌────────────────────────────┬────────────────────────────┐    │ │
+│  │  │ Only in client_a (23)     │ Only in client_b (11)      │    │ │
+│  │  ├────────────────────────────┼────────────────────────────┤    │ │
+│  │  │ 🔴 exposed_vcs (5)       │ 🔴 sql_injection (2)      │    │ │
+│  │  │ 🔴 weak_credentials (3)  │ 🟡 outdated_wp (4)        │    │ │
+│  │  │ 🟡 directory_index (8)   │ 🟡 open_redirect (3)      │    │ │
+│  │  │ 🔵 missing_headers (7)   │ 🔵 exposed_phpinfo (2)    │    │ │
+│  │  └────────────────────────────┴────────────────────────────┘    │ │
+│  │                                                                  │ │
+│  │  Severity Comparison:                                            │ │
+│  │  ┌──────────────────────────────────────────────────────────┐   │ │
+│  │  │ HIGH   │ client_a: ████████  8  │ client_b: ████  4     │   │ │
+│  │  │ MEDIUM │ client_a: ████████  8  │ client_b: ███████ 7   │   │ │
+│  │  │ LOW    │ client_a: ███████  7   │ client_b: ██  2       │   │ │
+│  │  └──────────────────────────────────────────────────────────┘   │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 The comparison logic reuses the existing `NormalForm` concept from `artemis/reporting/base/normal_form.py` — two findings are "the same" if they share the same normal form.
 
 ### Component 4: Saved Filters and Bookmarkable Searches
 
-- **URL-based state:** All filter parameters are encoded in the URL query string, making any filtered view shareable via link
-- **Saved Filters:** Stored in a new `SavedFilter` DB model:
-  ```python
-  class SavedFilter(Base):
-      __tablename__ = "saved_filter"
-      id = Column(Integer, primary_key=True)
-      name = Column(String)
-      filter_params = Column(JSONB)  # {tag, severity, module, date_range, search_query}
-      created_at = Column(DateTime, server_default=text("NOW()"))
-  ```
-- UI for managing saved filters: save current filter, load saved filter, delete
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Saved Filters                                      [+ New]     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ 📌 "High-sev client_a"    tag=client_a, severity=high  │    │
+│  │    [Load]  [Delete]  [Copy URL]                         │    │
+│  │                                                         │    │
+│  │ 📌 "VCS findings"         module=vcs, status=INTERESTING│    │
+│  │    [Load]  [Delete]  [Copy URL]                         │    │
+│  │                                                         │    │
+│  │ 📌 "Last week new"        date=7d, severity=all        │    │
+│  │    [Load]  [Delete]  [Copy URL]                         │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  URL: artemis.example.com/?tag=client_a&severity=high&module=vcs│
+│       ↑ All filters encoded in URL — shareable via link         │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-### Component 5: Performance Optimization for Analytics
+**Saved Filters model:**
+```python
+class SavedFilter(Base):
+    __tablename__ = "saved_filter"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    filter_params = Column(JSONB)  # {tag, severity, module, date_range, search_query}
+    created_at = Column(DateTime, server_default=text("NOW()"))
+```
 
-Analytics queries on large datasets can be slow. Mitigations:
+### Component 5: Performance Optimization Strategy
 
-1. **Materialized views** for frequently-accessed aggregations (daily/weekly stats) — refreshed on a schedule
-2. **Redis caching** with TTL (e.g., 5 minutes for dashboard data) using the existing `RedisCache` class
-3. **Date range limits** — UI defaults to last 90 days, preventing unbounded queries
-4. **New database indexes** — partial indexes on `status = 'INTERESTING'` for faster filtered queries:
-   ```sql
-   CREATE INDEX idx_task_result_interesting
-   ON task_result(tag, created_at)
-   WHERE status = 'INTERESTING';
-   ```
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                  PERFORMANCE OPTIMIZATION LAYERS                     │
+│                                                                     │
+│  Layer 1: Query Optimization                                        │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Partial Index                    Existing Indexes             │  │
+│  │  ┌─────────────────────────┐     ┌─────────────────────┐     │  │
+│  │  │ CREATE INDEX ... WHERE  │     │ tag (B-tree)        │     │  │
+│  │  │ status = 'INTERESTING'  │     │ status (B-tree)     │     │  │
+│  │  │ ON (tag, created_at)    │     │ created_at (B-tree) │     │  │
+│  │  └─────────────────────────┘     │ fulltext (GIN)      │     │  │
+│  │  ~10x faster for filtered queries└─────────────────────┘     │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  Layer 2: Redis Caching                                             │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Dashboard stats ─── TTL: 5 min ─── Auto-refresh on request  │  │
+│  │  Comparison data ─── TTL: 2 min ─── Invalidate on new scan   │  │
+│  │  Module stats    ─── TTL: 5 min ─── Background refresh       │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  Layer 3: Materialized Views (for >1M rows)                         │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  mv_daily_findings_count                                      │  │
+│  │  mv_tag_severity_summary    ← Refreshed every 15 minutes     │  │
+│  │  mv_module_performance                                        │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  Layer 4: Frontend Optimization                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Default range: 90 days │ Lazy-load charts │ Loading spinners │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Timeline and Deliverables
 
-### Community Bonding Period (May 8 - June 1)
-- Study Artemis's existing frontend patterns and Bootstrap usage
-- Profile existing database queries to understand performance baseline
-- Prototype Chart.js integration in a minimal Jinja2 template
-- Design the analytics API schema with mentor input
-- Submit a small PR to familiarize with the contribution process
+### Gantt Chart
+
+```
+        May         June           July           August         Sep
+       Week: 1 2 3 4 1 2 3 4 5 6 7 8 9 10 11 12  1
+             ├─┤                                      Community Bonding
+             │CB│
+                   ├─────────┤                        Phase 1: API + Charts
+                   │SQL│Cache│Chart.js│
+                             ├───┤                    ◆ Midterm Eval
+                                  ├─────────┤         Phase 2: Compare + Filters
+                                  │Comp│Risk│Filters│
+                                              ├──────┤Phase 3: Perf + Polish
+                                              │Idx│UI│Tests│Doc│
+                                                     ├┤ Final Eval
+
+Legend: CB=Community Bonding, ◆=Evaluation, SQL=SQL queries, Comp=Comparison
+```
 
 ### Phase 1: Weeks 1-4 (June 2 - June 29)
 
 **Deliverable: Analytics API endpoints and basic dashboard charts**
 
-| Week | Tasks |
-|------|-------|
-| 1 | Implement core analytics SQL queries; create `analytics_api.py` with findings-over-time and severity-distribution endpoints |
-| 2 | Add tags-summary, modules, and top-targets endpoints; implement Redis caching layer |
-| 3 | Redesign `index.jinja2` dashboard with overview cards and trend line chart using Chart.js |
-| 4 | Add severity distribution pie chart, module activity heatmap; ensure responsive design |
+| Week | Tasks | Deliverable | Hours |
+|------|-------|-------------|-------|
+| 1 | Core SQL queries; `analytics_api.py`; findings-over-time + severity endpoints | 2 working API endpoints | 30 |
+| 2 | Tags-summary, modules, top-targets endpoints; Redis caching layer | 6 API endpoints + caching | 30 |
+| 3 | Redesign `index.jinja2`; overview cards; trend line chart (Chart.js) | Dashboard with live data | 35 |
+| 4 | Severity pie chart; module bar chart; heatmap; responsive layout | Complete chart suite | 30 |
 
 ### Midterm Evaluation (June 30 - July 4)
 
@@ -204,78 +412,82 @@ Analytics queries on large datasets can be slow. Mitigations:
 
 **Deliverable: Comparison view, per-tag risk table, saved filters**
 
-| Week | Tasks |
-|------|-------|
-| 5 | Build comparison API endpoint using NormalForm matching; implement comparison page UI |
-| 6 | Enhance per-tag risk table with inline sparklines and sorting; add top-findings section |
-| 7 | Implement saved filters: DB model, API endpoints, UI for save/load/delete |
-| 8 | URL-based state for all filter parameters; ensure all views are bookmarkable |
+| Week | Tasks | Deliverable | Hours |
+|------|-------|-------------|-------|
+| 5 | Comparison API (NormalForm matching); comparison page UI | Working compare tool | 30 |
+| 6 | Enhanced per-tag table with sparklines; top-findings section | Risk breakdown view | 30 |
+| 7 | SavedFilter model; CRUD API; save/load/delete UI | Saved filters feature | 30 |
+| 8 | URL-based filter state; bookmarkable views; share via link | Shareable filter URLs | 25 |
 
 ### Phase 3: Weeks 9-12 (August 4 - August 31)
 
 **Deliverable: Performance optimization, polish, documentation**
 
-| Week | Tasks |
-|------|-------|
-| 9 | Add database indexes and materialized views for analytics; benchmark with large datasets |
-| 10 | UI polish: loading states, error handling, empty states, mobile responsiveness |
-| 11 | Write comprehensive tests: API unit tests, SQL query tests, frontend interaction tests |
-| 12 | Documentation: user guide for dashboard features, API docs, developer guide for extending |
+| Week | Tasks | Deliverable | Hours |
+|------|-------|-------------|-------|
+| 9 | Database indexes; materialized views; benchmark with large datasets | Perf improvements | 30 |
+| 10 | UI polish: loading states, errors, empty states, mobile | Production-ready UI | 30 |
+| 11 | API unit tests; SQL tests; frontend interaction tests | Test coverage | 30 |
+| 12 | User guide; API docs; developer extension guide | Complete documentation | 25 |
 
 ### Final Evaluation (September 1 - September 8)
 
 ---
 
-## Technical Challenges and Mitigations
+## Effort Breakdown
 
-| Challenge | Mitigation |
-|-----------|------------|
-| Aggregation queries on millions of rows may be slow | Use partial indexes, materialized views, and Redis caching with TTL |
-| Chart.js charts need to handle variable data ranges | Implement adaptive time bucketing (auto-select day/week/month based on range) |
-| Comparison across tags requires finding matching | Reuse existing `NormalForm` infrastructure from the reporting system |
-| Adding JS to a Jinja2 app without creating maintenance burden | Keep JS minimal, use Chart.js declaratively, avoid custom build pipeline |
-| Dashboard must remain usable during long-running queries | Use async API calls with loading spinners; cache aggressively |
+```
+                    Effort Distribution (350 hours)
+
+  ┌────────────────────────────────────────────────────────┐
+  │                                                        │
+  │  SQL Query Design          ████░░░░░░░░░░░░░  40h (11%)│
+  │  API Endpoints (FastAPI)   ██████░░░░░░░░░░░  50h (14%)│
+  │  Redis Caching Layer       ███░░░░░░░░░░░░░░  25h  (7%)│
+  │  Dashboard Charts (JS)     █████████░░░░░░░░  75h (21%)│
+  │  Comparison View           █████░░░░░░░░░░░░  45h (13%)│
+  │  Saved Filters             ████░░░░░░░░░░░░░  30h  (9%)│
+  │  Performance Optimization  ████░░░░░░░░░░░░░  30h  (9%)│
+  │  Testing                   ████░░░░░░░░░░░░░  35h (10%)│
+  │  Documentation             ██░░░░░░░░░░░░░░░  20h  (6%)│
+  │                                                        │
+  └────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Mockup: Dashboard Layout
+## Technical Challenges and Mitigations
+
+| Challenge | Risk | Mitigation |
+|-----------|------|------------|
+| Aggregation queries on millions of rows may be slow | High | Partial indexes, materialized views, Redis caching with TTL |
+| Chart.js charts need to handle variable data ranges | Low | Adaptive time bucketing (auto-select day/week/month based on range) |
+| Comparison across tags requires finding matching | Medium | Reuse existing `NormalForm` infrastructure from the reporting system |
+| Adding JS to a Jinja2 app without creating maintenance burden | Low | Keep JS minimal, use Chart.js declaratively, avoid custom build pipeline |
+| Dashboard must remain usable during long-running queries | Medium | Async API calls with loading spinners; cache aggressively |
+| Mobile responsiveness for chart-heavy pages | Low | Chart.js is responsive by default; test on mobile viewports |
+
+---
+
+## Technology Stack
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Artemis Dashboard                                    [+Add] │
-├──────────┬──────────┬──────────┬──────────┬──────────────────┤
-│ Analyses │ Findings │ High Sev │ Med Sev  │ Pending Tasks    │
-│   1,234  │   5,678  │   234    │  1,456   │     89           │
-├──────────┴──────────┴──────────┴──────────┴──────────────────┤
-│                                                              │
-│  Findings Over Time                          [1W][1M][3M][1Y]│
-│  ┌─────────────────────────────────────────────────────┐     │
-│  │  ▄                                                  │     │
-│  │  █▄    ▄                                            │     │
-│  │  ██▄  ▄█▄    ▄       ▄▄                             │     │
-│  │  ███▄▄███▄  ▄█▄   ▄▄██▄▄    ▄                      │     │
-│  │  ████████████████▄████████▄▄██▄                     │     │
-│  └─────────────────────────────────────────────────────┘     │
-│  Jan  Feb  Mar  Apr  May  Jun  Jul  Aug  Sep               │
-│                                                              │
-├─────────────────────────────┬────────────────────────────────┤
-│  Severity Distribution      │  Module Activity               │
-│   ┌──────────────┐          │  ┌────────────────────────┐    │
-│   │   ██ High    │          │  │ nuclei     ████████ 45 │    │
-│   │  ████ Med    │          │  │ bruter     ██████   34 │    │
-│   │ ██████ Low   │          │  │ vcs        ████     22 │    │
-│   └──────────────┘          │  │ wp_scanner ███      18 │    │
-│                             │  └────────────────────────┘    │
-├─────────────────────────────┴────────────────────────────────┤
-│  Per-Organization Breakdown                    [Filter] [⬇]  │
-│  ┌──────────┬────────┬──────┬───────┬────────┬───────────┐   │
-│  │ Tag      │ Total  │ High │ Med   │ Trend  │ Last Scan │   │
-│  ├──────────┼────────┼──────┼───────┼────────┼───────────┤   │
-│  │ client_a │ 45     │ 12   │ 20    │ ↗ +5   │ 2h ago    │   │
-│  │ client_b │ 23     │ 3    │ 8     │ ↘ -2   │ 1d ago    │   │
-│  │ client_c │ 67     │ 25   │ 30    │ → 0    │ 3h ago    │   │
-│  └──────────┴────────┴──────┴───────┴────────┴───────────┘   │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    TECHNOLOGY STACK                       │
+│                                                         │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
+│  │  Frontend   │  │   Backend    │  │   Database    │  │
+│  ├─────────────┤  ├──────────────┤  ├───────────────┤  │
+│  │ Chart.js    │  │ FastAPI      │  │ PostgreSQL 16 │  │
+│  │ Bootstrap 5 │  │ SQLAlchemy   │  │ (existing)    │  │
+│  │ Jinja2      │  │ Python 3.x   │  │               │  │
+│  │ Vanilla JS  │  │ Pydantic     │  │ Redis 7.2     │  │
+│  │             │  │              │  │ (existing)    │  │
+│  └─────────────┘  └──────────────┘  └───────────────┘  │
+│                                                         │
+│  No new frameworks. No build pipeline. Minimal JS.       │
+│  100% compatible with existing Artemis tech stack.       │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---

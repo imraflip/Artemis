@@ -18,48 +18,92 @@ Expanded Security Module Suite: Modern Web Attack Vectors
 ### Synopsis
 Artemis currently includes 30+ scanning modules covering common vulnerabilities like exposed VCS folders, SQL injection, weak credentials, and CMS-specific issues. However, it lacks detection for several critical modern web vulnerability classes that CSIRT teams regularly encounter: CORS misconfigurations, HTTP security header analysis, open redirects, subdomain takeover, JavaScript secrets exposure, and TLS/SSL configuration issues. This project adds a suite of 8 new, high-value scanning modules — each with corresponding reporting modules, unit tests, and documentation — significantly expanding Artemis's detection capabilities.
 
+### Coverage Gap Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│            ARTEMIS VULNERABILITY DETECTION COVERAGE                     │
+│                                                                         │
+│  ✅ CURRENTLY COVERED               ❌ GAPS (THIS PROJECT FILLS)       │
+│  ─────────────────────               ───────────────────────────        │
+│  ✅ CMS vulns (WP, Joomla, Drupal)  ❌ CORS Misconfigurations          │
+│  ✅ Credential bruting (FTP,SSH,DB)  ❌ HTTP Security Headers (native)  │
+│  ✅ Exposed VCS (.git, .svn, .hg)   ❌ Open Redirects                  │
+│  ✅ SQL Injection                    ❌ Subdomain Takeover              │
+│  ✅ LFI Detection                   ❌ JavaScript Secrets               │
+│  ✅ DNS misconfig (SPF, DMARC)      ❌ Backup/Config File Exposure     │
+│  ✅ Port scanning                    ❌ TLS/SSL Configuration           │
+│  ✅ Nuclei (generic CVEs)           ❌ SSRF Detection                   │
+│  ✅ Directory indexing                                                  │
+│  ✅ Domain expiration                                                   │
+│                                                                         │
+│  Coverage:  ██████████░░░░░░░  ~65%  →  ████████████████░  ~90%        │
+│             Current                      After this project             │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
 ### Motivation
-Reviewing the existing modules in `artemis/modules/`, Artemis has strong coverage for:
-- CMS vulnerabilities (WordPress, Joomla, Drupal)
-- Credential bruting (FTP, SSH, MySQL, PostgreSQL, WordPress admin)
-- Code/data exposure (VCS, directory index, bruter for backup files)
-- DNS issues (mail_dns_scanner, dangling DNS, domain expiration)
-- General scanning (Nuclei integration, port scanner, Shodan)
-
-But several vulnerability classes that appear frequently in real-world CSIRT reports are **not covered**:
-- CORS misconfigurations enabling cross-origin data theft
-- Missing/misconfigured HTTP security headers (beyond what `humble` does)
-- Open redirects used in phishing campaigns
-- Subdomain takeover via dangling DNS records pointing to unclaimed services
-- API keys and secrets exposed in JavaScript files
-- Exposed backup and configuration files (beyond current bruter wordlists)
-- TLS/SSL configuration problems (old protocols, weak ciphers, expired certs)
-- SSRF vulnerabilities via common injection points
-
-Each of these is a well-understood vulnerability class with clear detection methodology, making them ideal for automated scanning at scale.
+Reviewing the existing modules in `artemis/modules/`, Artemis has strong coverage for CMS vulnerabilities, credential bruting, code/data exposure, and DNS issues. But several vulnerability classes that appear frequently in real-world CSIRT reports are **not covered**. Each of the proposed 8 modules addresses a well-understood vulnerability class with clear detection methodology, making them ideal for automated scanning at scale.
 
 ---
 
 ## Detailed Description
+
+### How Modules Fit Into Artemis's Karton Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    ARTEMIS SCANNING PIPELINE                            │
+│                                                                         │
+│  User submits ──► Classifier ──►──┬──► port_scanner ──► SERVICE tasks  │
+│  target               │          │                         │           │
+│  (NEW task)           │          ├──► subdomain_enum       │           │
+│                        │          │                         ▼           │
+│                        ▼          │                  ┌────────────┐     │
+│                    DOMAIN task    │                  │ Existing   │     │
+│                        │          │                  │ modules:   │     │
+│                        │          │                  │ vcs,bruter │     │
+│                        │          │                  │ nuclei,... │     │
+│                        ▼          │                  └────────────┘     │
+│               ┌────────────────┐  │                        │           │
+│               │ NEW MODULE 4:  │  │                        │           │
+│               │ subdomain_     │  │                        ▼           │
+│               │ takeover       │  │              ┌──────────────────┐  │
+│               └────────────────┘  │              │ NEW MODULES      │  │
+│                                   │              │ (bind to SERVICE │  │
+│                        ┌──────────┘              │  + HTTP):        │  │
+│                        │                         │                  │  │
+│                        ▼                         │ 1. cors_scanner  │  │
+│                   URL tasks                      │ 2. security_hdrs │  │
+│                        │                         │ 6. backup_scan   │  │
+│                        ▼                         │ 7. tls_scanner   │  │
+│               ┌────────────────┐                 └──────────────────┘  │
+│               │ NEW MODULES    │                                       │
+│               │ (bind to URL): │                                       │
+│               │                │                                       │
+│               │ 3. open_redirect│                                      │
+│               │ 5. js_secrets  │                                       │
+│               │ 8. ssrf_detect │                                       │
+│               └────────────────┘                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ### Module Architecture Pattern
 
 Every Artemis module follows this pattern (studied from `artemis/modules/vcs.py`, `artemis/modules/bruter.py`, etc.):
 
 ```python
-@load_risk_class.load_risk_class(LoadRiskClass.LOW)  # LOW/MEDIUM/HIGH request volume
+@load_risk_class.load_risk_class(LoadRiskClass.LOW)
 class MyScanner(ArtemisBase):
-    identity = "my_scanner"                    # unique module ID
-    filters = [
-        {"type": TaskType.SERVICE.value, "service": Service.HTTP.value},
-    ]
+    identity = "my_scanner"
+    filters = [{"type": TaskType.SERVICE.value, "service": Service.HTTP.value}]
 
     def run(self, current_task: Task) -> None:
         url = get_target_url(current_task)
         # ... scanning logic ...
         self.db.save_task_result(
             task=current_task,
-            status=TaskStatus.INTERESTING,     # or TaskStatus.OK
+            status=TaskStatus.INTERESTING,
             status_reason="Description of finding",
             data=result_dict
         )
@@ -68,426 +112,504 @@ if __name__ == "__main__":
     MyScanner().loop()
 ```
 
-Each module also needs:
-1. **Reporter** in `artemis/reporting/modules/<name>/reporter.py` — converts `TaskResult` into `Report` objects
-2. **Email template** in `artemis/reporting/modules/<name>/template_*.jinja2`
-3. **Severity mapping** entry in `artemis/reporting/severity.py`
-4. **Docker service** entry in `docker-compose.yaml`
-5. **Unit tests** in `test/modules/test_<name>.py`
-6. **Documentation** in `docs/`
+**Each module requires these deliverables:**
 
-### Module 1: CORS Misconfiguration Detector
-
-**File:** `artemis/modules/cors_scanner.py`
-**Binds:** `TaskType.SERVICE` + `Service.HTTP`
-**Load Risk:** LOW
-
-**Detection methodology:**
-1. Send request with `Origin: https://evil.example.com` header
-2. Check if response contains `Access-Control-Allow-Origin: https://evil.example.com` (reflected origin)
-3. Send request with `Origin: null` — check for `Access-Control-Allow-Origin: null`
-4. Check for `Access-Control-Allow-Credentials: true` combined with wildcard or reflected origin
-5. Test common CORS bypass patterns: `Origin: https://target.com.evil.com`, `Origin: https://evil-target.com`
-
-**Result data:**
-```python
-{
-    "reflected_origin": True/False,
-    "null_origin_allowed": True/False,
-    "credentials_with_wildcard": True/False,
-    "tested_origins": ["https://evil.example.com", ...],
-    "vulnerable_endpoints": ["/api/v1/users", ...]
-}
 ```
-
-**Report types:** `cors_misconfiguration` (Severity: MEDIUM — can be HIGH with credentials)
-
-### Module 2: HTTP Security Headers Analyzer
-
-**File:** `artemis/modules/security_headers.py`
-**Binds:** `TaskType.SERVICE` + `Service.HTTP`
-**Load Risk:** LOW
-
-**Note:** Artemis already has a `humble` module that wraps the Humble tool for header analysis. This module provides a **native, more configurable** implementation that checks:
-
-1. **Content-Security-Policy (CSP):** Missing, or dangerously permissive (`unsafe-inline`, `unsafe-eval`, wildcard sources)
-2. **Strict-Transport-Security (HSTS):** Missing, or short `max-age`, missing `includeSubDomains`
-3. **X-Frame-Options:** Missing (clickjacking risk)
-4. **Permissions-Policy:** Missing (allows sensors/features by default)
-5. **Referrer-Policy:** Missing or set to `unsafe-url`
-6. **X-Content-Type-Options:** Missing `nosniff`
-7. **Cross-Origin-Opener-Policy / Cross-Origin-Resource-Policy:** Missing
-
-**Differs from humble:**
-- Pure Python (no external tool dependency)
-- Reports individual header issues as separate findings with specific remediation
-- Configurable via `ModuleRuntimeConfiguration` — choose which headers to check, minimum HSTS age
-- Produces machine-readable results suitable for automated triage
-
-**Result data:**
-```python
-{
-    "missing_headers": ["Content-Security-Policy", "Permissions-Policy"],
-    "misconfigured_headers": {
-        "Strict-Transport-Security": {
-            "value": "max-age=86400",
-            "issue": "max-age too short (recommended: 31536000)"
-        },
-        "Content-Security-Policy": {
-            "value": "default-src 'self' 'unsafe-inline'",
-            "issue": "unsafe-inline allows XSS bypass"
-        }
-    }
-}
+┌─────────────────────────────────────────────────────────────────────────┐
+│                PER-MODULE DELIVERABLES CHECKLIST                        │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  📁 artemis/modules/<name>.py          — Scanning logic         │   │
+│  │  📁 artemis/reporting/modules/<name>/                           │   │
+│  │     ├── reporter.py                    — TaskResult → Report    │   │
+│  │     └── template_<type>.jinja2         — Email template         │   │
+│  │  📁 artemis/reporting/severity.py      — Add severity mapping   │   │
+│  │  📁 docker-compose.yaml                — Add container service  │   │
+│  │  📁 test/modules/test_<name>.py        — Unit tests             │   │
+│  │  📁 docs/                              — Module documentation   │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+│  Total per module: ~6 files, ~300-500 lines                             │
+│  Total for project: ~48 files, ~3000-4000 lines                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
-
-**Report types:** `missing_security_headers_detailed`, `misconfigured_security_header` (Severity: LOW-MEDIUM)
-
-### Module 3: Open Redirect Scanner
-
-**File:** `artemis/modules/open_redirect.py`
-**Binds:** `TaskType.URL` (requires crawled URLs)
-**Load Risk:** LOW
-
-**Detection methodology:**
-1. Identify URL parameters that may be redirect targets: `url`, `redirect`, `next`, `return`, `returnTo`, `goto`, `continue`, `dest`, `destination`, `redir`, `redirect_uri`, `return_url`
-2. For each parameter found in crawled URLs, replace the value with a canary URL (e.g., `https://evil.example.com`)
-3. Follow the response — if the `Location` header or meta refresh points to the canary domain, it's an open redirect
-4. Also check JavaScript-based redirects in response body (`window.location`, `document.location`)
-
-**Handling false positives:**
-- Verify the redirect actually leads to the injected domain (not just reflects it in page content)
-- Check multiple canary patterns to avoid WAF-like transformations
-- Don't report redirects to same-site URLs
-
-**Result data:**
-```python
-{
-    "vulnerable_urls": [
-        {
-            "original_url": "https://example.com/login?next=...",
-            "parameter": "next",
-            "redirect_type": "header",  # or "javascript"
-        }
-    ]
-}
-```
-
-**Report types:** `open_redirect` (Severity: MEDIUM)
-
-### Module 4: Subdomain Takeover Detector
-
-**File:** `artemis/modules/subdomain_takeover.py`
-**Binds:** `TaskType.DOMAIN`
-**Load Risk:** LOW
-
-**Note:** A version exists in `modules-extra` but is not in the core tree. This is a clean-room implementation.
-
-**Detection methodology:**
-1. Resolve the domain's CNAME chain
-2. Check if the CNAME target belongs to a known cloud service fingerprint set:
-   - **GitHub Pages:** CNAME to `*.github.io`, returns 404 with "There isn't a GitHub Pages site here"
-   - **AWS S3:** CNAME to `*.s3.amazonaws.com`, returns "NoSuchBucket"
-   - **Heroku:** CNAME to `*.herokuapp.com`, returns "No such app"
-   - **Azure:** CNAME to `*.azurewebsites.net`, returns 404
-   - **Shopify:** CNAME to `*.myshopify.com`, returns "Sorry, this shop is currently unavailable"
-   - **Fastly:** CNAME to `*.fastly.net`, returns "Fastly error: unknown domain"
-   - **Pantheon, Surge, Fly.io, etc.**
-3. Attempt to connect and match the response body/status against known fingerprints
-4. If CNAME points to a service that returns a "not configured" response, flag as potential takeover
-
-**Fingerprint database** stored in `artemis/modules/data/subdomain_takeover_fingerprints.json`:
-```json
-[
-    {
-        "service": "GitHub Pages",
-        "cname_patterns": ["*.github.io"],
-        "response_fingerprints": ["There isn't a GitHub Pages site here"],
-        "nxdomain": false,
-        "severity": "high"
-    },
-    ...
-]
-```
-
-**Result data:**
-```python
-{
-    "vulnerable": True,
-    "cname_chain": ["sub.example.com", "example.github.io"],
-    "service": "GitHub Pages",
-    "fingerprint_match": "There isn't a GitHub Pages site here"
-}
-```
-
-**Report types:** `subdomain_takeover_possible` (Severity: HIGH — already defined in `severity.py`)
-
-### Module 5: JavaScript Secrets Scanner
-
-**File:** `artemis/modules/js_secrets_scanner.py`
-**Binds:** `TaskType.URL` (operates on discovered URLs with `.js` extension)
-**Load Risk:** LOW
-
-**Detection methodology:**
-1. From crawled URLs, identify JavaScript files
-2. Fetch each JS file (using `self.http_get`)
-3. Scan content against a regex pattern database for:
-   - AWS Access Keys: `AKIA[0-9A-Z]{16}`
-   - Google API Keys: `AIza[0-9A-Za-z\-_]{35}`
-   - Slack Tokens: `xox[baprs]-[0-9a-zA-Z]{10,}`
-   - Private Keys: `-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----`
-   - Generic API keys: `api[_-]?key['":\s]*[=:]\s*['"][0-9a-zA-Z]{20,}['"]`
-   - JWT tokens: `eyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]*`
-   - Database connection strings: `(mongodb|postgres|mysql)://[^'"}\s]+`
-4. Filter false positives by checking entropy (high-entropy strings are more likely real secrets)
-5. Exclude known public/placeholder values (e.g., example API keys from documentation)
-
-**Pattern database** stored in `artemis/modules/data/js_secrets_patterns.py`:
-```python
-SECRET_PATTERNS = [
-    SecretPattern(
-        name="AWS Access Key ID",
-        regex=r"AKIA[0-9A-Z]{16}",
-        severity="high",
-        min_entropy=3.0,
-    ),
-    ...
-]
-```
-
-**Result data:**
-```python
-{
-    "secrets_found": [
-        {
-            "type": "AWS Access Key ID",
-            "file": "https://example.com/assets/app.js",
-            "line": 142,
-            "match_preview": "AKIA...XXXX",  # partially redacted
-            "entropy": 4.2
-        }
-    ]
-}
-```
-
-**Report types:** `exposed_js_secret` (Severity: HIGH)
-
-### Module 6: Exposed Backup/Config File Scanner
-
-**File:** `artemis/modules/backup_scanner.py`
-**Binds:** `TaskType.SERVICE` + `Service.HTTP`
-**Load Risk:** MEDIUM (makes multiple HTTP requests)
-
-**This extends the existing `bruter.py` module** but focuses specifically on backup and configuration files with targeted detection logic (not just checking for 200 status).
-
-**Scan targets:**
-```
-.env, .env.bak, .env.local, .env.production
-config.php~, config.php.bak, config.php.old, config.php.swp
-wp-config.php.bak, wp-config.php~, wp-config.php.old
-database.yml, database.yml.bak
-.htpasswd, .htaccess.bak
-web.config.bak, web.config.old
-backup.sql, dump.sql, database.sql, db.sql
-backup.tar.gz, backup.zip, site.tar.gz, www.tar.gz
-application.properties, application.yml
-settings.py, settings.py.bak, local_settings.py
-```
-
-**Detection logic (beyond status code):**
-- For `.env` files: check for `KEY=value` patterns (not just HTML error pages returning 200)
-- For `.sql` files: check for SQL keywords like `CREATE TABLE`, `INSERT INTO`
-- For archive files: check `Content-Type` header for `application/zip`, `application/gzip`
-- For PHP backup files: check for `<?php` in content
-- For config files: check for structured content (YAML, JSON, INI patterns)
-
-**Result data:**
-```python
-{
-    "exposed_files": [
-        {
-            "url": "https://example.com/.env",
-            "type": "environment_file",
-            "content_preview": "DB_HOST=...",  # first 200 chars, secrets redacted
-            "contains_credentials": True
-        }
-    ]
-}
-```
-
-**Report types:** `exposed_backup_file`, `exposed_config_file` (Severity: HIGH)
-
-### Module 7: TLS/SSL Configuration Checker
-
-**File:** `artemis/modules/tls_scanner.py`
-**Binds:** `TaskType.SERVICE` + `Service.HTTP` (only SSL-enabled services)
-**Load Risk:** LOW
-
-**Detection methodology (using Python's `ssl` and `socket` modules):**
-1. **Protocol version check:** Attempt connection with TLS 1.0 and TLS 1.1 — report if accepted
-2. **Certificate validation:**
-   - Check expiration date (report if expired or expiring within 30 days)
-   - Check if self-signed
-   - Check if certificate names match the domain
-3. **Cipher suite analysis:**
-   - Enumerate accepted cipher suites
-   - Flag weak ciphers (RC4, DES, 3DES, export ciphers, NULL ciphers)
-   - Flag missing forward secrecy (non-ECDHE/DHE ciphers)
-4. **HSTS preload check:** Query the domain against the HSTS preload list
-
-**Note:** This module intentionally overlaps slightly with Nuclei's TLS checks but provides structured, Artemis-native results that feed into the reporting pipeline with proper severity classification.
-
-**Result data:**
-```python
-{
-    "tls_issues": {
-        "old_tls_versions": ["TLSv1.0", "TLSv1.1"],
-        "weak_ciphers": ["TLS_RSA_WITH_RC4_128_SHA"],
-        "certificate": {
-            "expired": False,
-            "expires_soon": True,
-            "expiry_date": "2026-04-15",
-            "self_signed": False,
-            "name_mismatch": False
-        },
-        "missing_forward_secrecy": True
-    }
-}
-```
-
-**Report types:** `weak_tls_configuration`, `expired_ssl_certificate`, `almost_expired_ssl_certificate`, `bad_certificate_names` (Severity: LOW-MEDIUM — some already defined in `severity.py`)
-
-### Module 8: SSRF Detection Module
-
-**File:** `artemis/modules/ssrf_detector.py`
-**Binds:** `TaskType.URL` (requires crawled URLs with parameters)
-**Load Risk:** LOW
-
-**Detection methodology:**
-1. Identify URL parameters that may fetch external resources: `url`, `uri`, `path`, `src`, `href`, `file`, `load`, `fetch`, `proxy`, `page`, `callback`
-2. For each candidate parameter, inject:
-   - A callback URL pointing to an Artemis-controlled canary service (or DNS-based detection)
-   - Internal network addresses: `http://127.0.0.1`, `http://169.254.169.254` (cloud metadata)
-3. **DNS-based detection:** Generate a unique subdomain for each test (e.g., `<uuid>.ssrf-test.artemis.local`) and check DNS logs for resolution
-4. **Response-based detection:** If injecting `http://127.0.0.1` returns different content than the original, potential SSRF
-
-**Safety considerations:**
-- Only test with benign payloads (canary domains, localhost)
-- Rate-limited to avoid abuse
-- Configurable: disabled by default, requires explicit opt-in via `ModuleRuntimeConfiguration`
-- Document that this module actively probes targets and should only be used on authorized systems
-
-**Result data:**
-```python
-{
-    "ssrf_candidates": [
-        {
-            "url": "https://example.com/proxy?url=...",
-            "parameter": "url",
-            "detection_method": "dns_callback",  # or "response_diff"
-            "payload": "https://<uuid>.ssrf-test.example.com"
-        }
-    ]
-}
-```
-
-**Report types:** `ssrf_vulnerability` (Severity: HIGH)
 
 ---
 
-## Cross-Cutting Concerns
+### Module Overview Table
 
-### Reporting Integration
-Each module's reporter follows the exact pattern established by existing reporters (e.g., `VCSReporter`):
-- Check `task_result["headers"]["receiver"]` matches the module identity
-- Check `task_result["status"] == "INTERESTING"`
-- Create `Report` objects with proper `top_level_target`, `target`, `report_type`, `additional_data`
-- Provide Jinja2 email template fragments
+| # | Module | File | Binds To | Load Risk | Severity | Detection Method |
+|---|--------|------|----------|-----------|----------|------------------|
+| 1 | CORS Scanner | `cors_scanner.py` | SERVICE+HTTP | LOW | MEDIUM | Reflected origin, null origin, credentials check |
+| 2 | Security Headers | `security_headers.py` | SERVICE+HTTP | LOW | LOW-MED | Missing/misconfigured CSP, HSTS, X-Frame, etc. |
+| 3 | Open Redirect | `open_redirect.py` | URL | LOW | MEDIUM | Parameter injection with canary URLs |
+| 4 | Subdomain Takeover | `subdomain_takeover.py` | DOMAIN | LOW | HIGH | CNAME chain + cloud service fingerprints |
+| 5 | JS Secrets Scanner | `js_secrets_scanner.py` | URL | LOW | HIGH | Regex patterns + entropy filtering |
+| 6 | Backup Scanner | `backup_scanner.py` | SERVICE+HTTP | MEDIUM | HIGH | Path probing + content-type validation |
+| 7 | TLS/SSL Checker | `tls_scanner.py` | SERVICE+HTTP | LOW | LOW-MED | Protocol version, ciphers, certificate checks |
+| 8 | SSRF Detector | `ssrf_detector.py` | URL | LOW | HIGH | DNS callback + response diff analysis |
 
-### Severity Mapping
-New entries in `artemis/reporting/severity.py`:
-```python
-ReportType("cors_misconfiguration"): Severity.MEDIUM,
-ReportType("missing_security_headers_detailed"): Severity.LOW,
-ReportType("misconfigured_security_header"): Severity.MEDIUM,
-ReportType("open_redirect"): Severity.MEDIUM,
-ReportType("exposed_js_secret"): Severity.HIGH,
-ReportType("exposed_backup_file"): Severity.HIGH,
-ReportType("exposed_config_file"): Severity.HIGH,
-ReportType("weak_tls_configuration"): Severity.MEDIUM,
-ReportType("ssrf_vulnerability"): Severity.HIGH,
+---
+
+### Module 1: CORS Misconfiguration Detector
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  CORS SCANNER — DETECTION FLOW                                      │
+│                                                                     │
+│  Target URL                                                         │
+│      │                                                              │
+│      ├──► Test 1: Origin: https://evil.example.com                  │
+│      │    Check: ACAO header reflects evil.example.com?              │
+│      │    ┌──────────────┐                                          │
+│      │    │ Response:    │  YES → 🔴 Reflected Origin               │
+│      │    │ ACAO: evil.. │  NO  → Continue                          │
+│      │    └──────────────┘                                          │
+│      │                                                              │
+│      ├──► Test 2: Origin: null                                      │
+│      │    Check: ACAO: null?                                        │
+│      │    YES → 🟡 Null Origin Allowed                              │
+│      │                                                              │
+│      ├──► Test 3: Check Access-Control-Allow-Credentials: true      │
+│      │    Combined with wildcard/reflected?                          │
+│      │    YES → 🔴 Credentials + Wildcard (upgrade to HIGH)        │
+│      │                                                              │
+│      └──► Test 4: Bypass patterns                                   │
+│           Origin: https://target.com.evil.com                       │
+│           Origin: https://evil-target.com                           │
+│           Reflected? → 🔴 CORS Bypass                               │
+│                                                                     │
+│  Output: {reflected_origin, null_allowed, creds_with_wildcard,      │
+│           tested_origins[], vulnerable_endpoints[]}                  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Testing Strategy
-Each module gets:
-1. **Unit tests** in `test/modules/test_<name>.py` using mocked HTTP responses
-2. **Test fixtures** with known-vulnerable and known-safe response data
-3. **Reporter tests** verifying correct `Report` generation from sample `TaskResult` data
+**Report types:** `cors_misconfiguration` (Severity: MEDIUM, HIGH with credentials)
 
-The test pattern follows existing modules (e.g., `test/modules/test_vcs.py`).
+### Module 2: HTTP Security Headers Analyzer
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  SECURITY HEADERS — CHECK MATRIX                                     │
+│                                                                      │
+│  Header                      │ Check                  │ Severity    │
+│  ────────────────────────────┼────────────────────────┼────────────  │
+│  Content-Security-Policy     │ Missing?               │ MEDIUM      │
+│                              │ unsafe-inline?         │ MEDIUM      │
+│                              │ unsafe-eval?           │ MEDIUM      │
+│                              │ wildcard sources?      │ LOW         │
+│  ────────────────────────────┼────────────────────────┼────────────  │
+│  Strict-Transport-Security   │ Missing?               │ MEDIUM      │
+│                              │ max-age < 31536000?    │ LOW         │
+│                              │ No includeSubDomains?  │ LOW         │
+│  ────────────────────────────┼────────────────────────┼────────────  │
+│  X-Frame-Options             │ Missing?               │ MEDIUM      │
+│  Permissions-Policy          │ Missing?               │ LOW         │
+│  Referrer-Policy             │ Missing or unsafe-url? │ LOW         │
+│  X-Content-Type-Options      │ Missing nosniff?       │ LOW         │
+│  Cross-Origin-Opener-Policy  │ Missing?               │ LOW         │
+│  Cross-Origin-Resource-Policy│ Missing?               │ LOW         │
+│                                                                      │
+│  Differs from existing `humble` module:                              │
+│  • Pure Python (no external tool dependency)                         │
+│  • Individual findings with specific remediation                     │
+│  • Configurable via ModuleRuntimeConfiguration                       │
+│  • Machine-readable output for automated triage                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Module 3: Open Redirect Scanner
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  OPEN REDIRECT — DETECTION FLOW                                      │
+│                                                                     │
+│  Crawled URL: https://example.com/login?next=/dashboard             │
+│                                                                     │
+│  Step 1: Identify redirect parameters                               │
+│  ┌───────────────────────────────────────────────────────┐          │
+│  │ Param Names:  url, redirect, next, return, returnTo,  │          │
+│  │               goto, continue, dest, destination,       │          │
+│  │               redir, redirect_uri, return_url          │          │
+│  └───────────────────────────────────────────────────────┘          │
+│         │ Found: "next" parameter                                   │
+│         ▼                                                           │
+│  Step 2: Inject canary URL                                          │
+│  ┌───────────────────────────────────────────────────────┐          │
+│  │ GET /login?next=https://evil.example.com               │          │
+│  └───────────────────────────────────────────────────────┘          │
+│         │                                                           │
+│         ▼                                                           │
+│  Step 3: Check response                                             │
+│  ┌────────────────────────┬──────────────────────────────┐          │
+│  │ Location header        │ → Redirect to evil.example?  │          │
+│  │ Meta refresh           │ → Points to evil.example?    │          │
+│  │ JS (window.location)   │ → Sets evil.example?         │          │
+│  └────────────────────────┴──────────────────────────────┘          │
+│         │                                                           │
+│     YES │                         NO                                │
+│         ▼                          ▼                                │
+│  ┌──────────────┐          ┌──────────────┐                        │
+│  │ 🟡 OPEN      │          │    SAFE      │                        │
+│  │    REDIRECT   │          │   (skip)     │                        │
+│  └──────────────┘          └──────────────┘                        │
+│                                                                     │
+│  False Positive Mitigations:                                        │
+│  • Verify redirect actually reaches injected domain                 │
+│  • Exclude same-site redirects                                      │
+│  • Test multiple canary patterns for WAF bypass                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Module 4: Subdomain Takeover Detector
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  SUBDOMAIN TAKEOVER — DETECTION FLOW                                 │
+│                                                                     │
+│  Input: sub.example.com (DOMAIN task)                               │
+│         │                                                           │
+│         ▼                                                           │
+│  ┌──────────────────────────────┐                                   │
+│  │ Step 1: Resolve CNAME chain │                                   │
+│  │ sub.example.com              │                                   │
+│  │  └─ CNAME: example.github.io│                                   │
+│  └──────────────┬───────────────┘                                   │
+│                 │                                                    │
+│                 ▼                                                    │
+│  ┌──────────────────────────────────────────────────────────┐       │
+│  │ Step 2: Match against fingerprint database                │       │
+│  │                                                          │       │
+│  │  Service         │ CNAME Pattern        │ Fingerprint    │       │
+│  │  ────────────────┼──────────────────────┼───────────────  │       │
+│  │  GitHub Pages    │ *.github.io          │ "There isn't  │       │
+│  │                  │                      │  a GitHub..." │       │
+│  │  AWS S3          │ *.s3.amazonaws.com   │ "NoSuchBucket"│       │
+│  │  Heroku          │ *.herokuapp.com      │ "No such app" │       │
+│  │  Azure           │ *.azurewebsites.net  │ 404 page      │       │
+│  │  Shopify         │ *.myshopify.com      │ "Sorry, this  │       │
+│  │                  │                      │  shop is..."  │       │
+│  │  Fastly          │ *.fastly.net         │ "Fastly error"│       │
+│  │  Pantheon        │ *.pantheonsite.io    │ 404 + pattern │       │
+│  │  Surge.sh        │ *.surge.sh           │ "project not  │       │
+│  │                  │                      │  found"       │       │
+│  └──────────────────┼──────────────────────┼────────────────┘       │
+│                     │ MATCH FOUND          │                        │
+│                     ▼                      │                        │
+│  ┌──────────────────────────────┐          │                        │
+│  │ Step 3: Fetch & confirm     │          │                        │
+│  │ Response matches fingerprint│          │                        │
+│  └──────────────┬───────────────┘          │                        │
+│            YES  │                     NO   │                        │
+│                 ▼                          ▼                        │
+│          ┌──────────────┐          ┌──────────┐                    │
+│          │ 🔴 TAKEOVER  │          │   SAFE   │                    │
+│          │    POSSIBLE   │          │          │                    │
+│          └──────────────┘          └──────────┘                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Module 5: JavaScript Secrets Scanner
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  JS SECRETS SCANNER — DETECTION PIPELINE                             │
+│                                                                     │
+│  Crawled URLs                                                       │
+│      │                                                              │
+│      ▼                                                              │
+│  ┌──────────────────────┐                                           │
+│  │ Filter: *.js files   │                                           │
+│  │ app.js, bundle.js,   │                                           │
+│  │ vendor.js, ...       │                                           │
+│  └──────────┬───────────┘                                           │
+│             │                                                       │
+│             ▼                                                       │
+│  ┌──────────────────────────────────────────────────────────┐       │
+│  │ Pattern Database (regex + metadata)                       │       │
+│  │                                                          │       │
+│  │  Pattern                    │ Type          │ Severity   │       │
+│  │  ──────────────────────────┼───────────────┼──────────   │       │
+│  │  AKIA[0-9A-Z]{16}          │ AWS Access Key│ 🔴 HIGH    │       │
+│  │  AIza[0-9A-Za-z\-_]{35}    │ Google API Key│ 🔴 HIGH    │       │
+│  │  xox[baprs]-[0-9a-zA-Z]+  │ Slack Token   │ 🔴 HIGH    │       │
+│  │  -----BEGIN.*PRIVATE KEY   │ Private Key   │ 🔴 HIGH    │       │
+│  │  eyJ[A-Za-z0-9-_=]+\.eyJ  │ JWT Token     │ 🟡 MEDIUM  │       │
+│  │  (mongodb|postgres)://     │ DB Conn String│ 🔴 HIGH    │       │
+│  │  api[_-]?key.*['"]{20,}   │ Generic API   │ 🟡 MEDIUM  │       │
+│  └──────────────────────────────────────────────────────────┘       │
+│             │                                                       │
+│             ▼                                                       │
+│  ┌──────────────────────┐     ┌──────────────────────┐              │
+│  │ Entropy Filter       │     │ Exclude List         │              │
+│  │                      │     │                      │              │
+│  │ Calculate Shannon    │     │ Known test keys:     │              │
+│  │ entropy of match     │     │ • AKIAIOSFODNN7...   │              │
+│  │                      │     │ • AIzaSyExample...   │              │
+│  │ min_entropy=3.0      │     │ • xoxb-example-...   │              │
+│  │ (filters out low-    │     │                      │              │
+│  │  entropy placeholders│     │ Skip if exact match  │              │
+│  │  like "AAAA...")     │     │ to known placeholder │              │
+│  └──────────┬───────────┘     └──────────┬───────────┘              │
+│             │                            │                          │
+│             └──────────┬─────────────────┘                          │
+│                        ▼                                            │
+│  ┌──────────────────────────────────────┐                           │
+│  │ Output: Partially redacted matches   │                           │
+│  │ {type, file, line, "AKIA...XXXX"}    │                           │
+│  └──────────────────────────────────────┘                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Module 6: Exposed Backup/Config File Scanner
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  BACKUP SCANNER — INTELLIGENT CONTENT VALIDATION                     │
+│                                                                     │
+│  Unlike naive 200-status checking, this module validates content:    │
+│                                                                     │
+│  File Type        │ Probe Path          │ Validation Logic          │
+│  ─────────────────┼─────────────────────┼─────────────────────────  │
+│  .env             │ /.env, /.env.bak    │ Contains KEY=value        │
+│                   │ /.env.local         │ patterns (not HTML)       │
+│  ─────────────────┼─────────────────────┼─────────────────────────  │
+│  PHP config       │ /config.php~        │ Contains <?php            │
+│                   │ /wp-config.php.bak  │                           │
+│  ─────────────────┼─────────────────────┼─────────────────────────  │
+│  SQL dump         │ /backup.sql         │ Contains CREATE TABLE     │
+│                   │ /dump.sql           │ or INSERT INTO            │
+│  ─────────────────┼─────────────────────┼─────────────────────────  │
+│  Archives         │ /backup.tar.gz      │ Content-Type matches      │
+│                   │ /backup.zip         │ application/zip or gzip   │
+│  ─────────────────┼─────────────────────┼─────────────────────────  │
+│  Config files     │ /application.yml    │ Valid YAML/JSON/INI       │
+│                   │ /settings.py        │ structure detected        │
+│  ─────────────────┼─────────────────────┼─────────────────────────  │
+│  Credentials      │ /.htpasswd          │ username:hash format      │
+│                   │ /.htaccess.bak      │                           │
+│                                                                     │
+│  False positive prevention:                                         │
+│  ┌────────────────────────────────────────────────────────┐         │
+│  │  200 status ──► Content validation ──► Not HTML error? │         │
+│  │  (not enough)    (required)             (required)      │         │
+│  └────────────────────────────────────────────────────────┘         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Module 7: TLS/SSL Configuration Checker
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  TLS SCANNER — CHECK CATEGORIES                                      │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ Category 1: Protocol Versions                                │    │
+│  │ ┌──────────┬──────────┬──────────┬──────────┬──────────┐    │    │
+│  │ │ SSLv3    │ TLS 1.0  │ TLS 1.1  │ TLS 1.2  │ TLS 1.3  │    │    │
+│  │ │ 🔴 FAIL  │ 🔴 FAIL  │ 🟡 WARN  │ ✅ OK    │ ✅ OK    │    │    │
+│  │ └──────────┴──────────┴──────────┴──────────┴──────────┘    │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ Category 2: Certificate                                      │    │
+│  │                                                              │    │
+│  │  Check              │ Result Example        │ Severity       │    │
+│  │  ────────────────────┼───────────────────────┼──────────      │    │
+│  │  Expired?           │ Expired 2026-01-15    │ 🟡 MEDIUM     │    │
+│  │  Expiring soon?     │ Expires in 12 days    │ 🔵 LOW        │    │
+│  │  Self-signed?       │ No CA chain           │ 🔵 LOW        │    │
+│  │  Name mismatch?     │ CN=other.com          │ 🔵 LOW        │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ Category 3: Cipher Suites                                    │    │
+│  │                                                              │    │
+│  │  ✅ GOOD: TLS_AES_256_GCM_SHA384                            │    │
+│  │  ✅ GOOD: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256             │    │
+│  │  🔴 WEAK: TLS_RSA_WITH_RC4_128_SHA                          │    │
+│  │  🔴 WEAK: TLS_RSA_WITH_3DES_EDE_CBC_SHA                     │    │
+│  │  🟡 NO FORWARD SECRECY: TLS_RSA_WITH_AES_256_CBC_SHA        │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Module 8: SSRF Detection Module
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  SSRF DETECTOR — DETECTION METHODOLOGY                               │
+│                                                                     │
+│  ⚠️ This module is OPT-IN (disabled by default) — it actively      │
+│  probes targets and should only be used on authorized systems.       │
+│                                                                     │
+│  Crawled URL with parameters                                        │
+│      │                                                              │
+│      ▼                                                              │
+│  ┌──────────────────────────────────────────────┐                   │
+│  │ Step 1: Identify candidate parameters         │                   │
+│  │ url, uri, path, src, href, file, load, fetch, │                   │
+│  │ proxy, page, callback                         │                   │
+│  └──────────────────────┬───────────────────────┘                   │
+│                         │                                           │
+│          ┌──────────────┴──────────────┐                            │
+│          │                             │                            │
+│          ▼                             ▼                            │
+│  ┌───────────────────┐       ┌───────────────────┐                  │
+│  │ Method A:          │       │ Method B:          │                  │
+│  │ DNS Callback       │       │ Response Diff      │                  │
+│  │                    │       │                    │                  │
+│  │ Inject:            │       │ Inject:            │                  │
+│  │ <uuid>.ssrf-test.  │       │ http://127.0.0.1   │                  │
+│  │ artemis.local      │       │                    │                  │
+│  │                    │       │ Compare response   │                  │
+│  │ Check DNS logs     │       │ with original      │                  │
+│  │ for resolution     │       │                    │                  │
+│  └────────┬──────────┘       └────────┬──────────┘                  │
+│           │                           │                             │
+│     DNS query         Response differs                              │
+│     observed?         significantly?                                │
+│           │                           │                             │
+│      YES  │                      YES  │                             │
+│           ▼                           ▼                             │
+│    ┌──────────────┐            ┌──────────────┐                     │
+│    │ 🔴 SSRF      │            │ 🟡 Potential │                     │
+│    │    CONFIRMED  │            │    SSRF       │                     │
+│    └──────────────┘            └──────────────┘                     │
+│                                                                     │
+│  Safety Controls:                                                   │
+│  ┌─────────────────────────────────────────────────────────┐        │
+│  │ • Disabled by default (opt-in via RuntimeConfiguration) │        │
+│  │ • Only benign payloads (canary domains, localhost)       │        │
+│  │ • Rate-limited via existing REQUESTS_PER_SECOND          │        │
+│  │ • Documented as active probing module                    │        │
+│  └─────────────────────────────────────────────────────────┘        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Severity Mapping
+
+New entries in `artemis/reporting/severity.py`:
+
+| Report Type | Severity | Justification |
+|-------------|----------|---------------|
+| `cors_misconfiguration` | MEDIUM | Data theft via cross-origin requests |
+| `cors_misconfiguration_with_credentials` | HIGH | Credential theft possible |
+| `missing_security_headers_detailed` | LOW | Defense-in-depth, not direct exploit |
+| `misconfigured_security_header` | MEDIUM | CSP bypass enables XSS |
+| `open_redirect` | MEDIUM | Used in phishing campaigns |
+| `subdomain_takeover_possible` | HIGH | Full domain control (already in severity.py) |
+| `exposed_js_secret` | HIGH | Credential exposure |
+| `exposed_backup_file` | HIGH | Source code / data exposure |
+| `exposed_config_file` | HIGH | Credential exposure |
+| `weak_tls_configuration` | MEDIUM | Downgrade attack risk |
+| `expired_ssl_certificate` | LOW | Already in severity.py |
+| `ssrf_vulnerability` | HIGH | Internal network access |
 
 ---
 
 ## Timeline and Deliverables
 
-### Community Bonding Period (May 8 - June 1)
-- Deep study of `ArtemisBase`, `TaskType`, `Service` binds, and module lifecycle
-- Study existing modules: `vcs.py`, `bruter.py`, `humble.py` for patterns
-- Research detection methodologies for each vulnerability class
-- Build the subdomain takeover fingerprint database
-- Submit a small module bugfix or enhancement as a warmup PR
+### Gantt Chart — Module Development Schedule
 
-### Phase 1: Weeks 1-4 (June 2 - June 29)
+```
+        May         June           July           August         Sep
+       Week: 1 2 3 4 1 2 3 4 5 6 7 8 9 10 11 12  1
+             ├─┤                                      Community Bonding
+             │CB│
+                   ├─────────┤                        Phase 1: Modules 1-3
+                   │M1│M2│M3│Integration│
+                             ├───┤                    ◆ Midterm Eval
+                                  ├─────────┤         Phase 2: Modules 4-6
+                                  │M4│M5│M6│Reporters│
+                                              ├──────┤Phase 3: Modules 7-8
+                                              │M7│M8│E2E│Docs│
+                                                     ├┤ Final Eval
 
-**Deliverable: Modules 1-3 (CORS, Security Headers, Open Redirect)**
+Legend: M1-M8 = Module 1-8, CB = Community Bonding
+```
 
-| Week | Tasks |
-|------|-------|
-| 1 | Implement CORS scanner module + reporter + email template + unit tests |
-| 2 | Implement Security Headers analyzer module + reporter + tests |
-| 3 | Implement Open Redirect scanner module + reporter + tests |
-| 4 | Integration testing of all 3 modules; add severity mappings; Docker entries |
+### Development Cadence Per Module
 
-### Midterm Evaluation (June 30 - July 4)
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  TYPICAL MODULE DEVELOPMENT CYCLE (~35-45 hours each)           │
+│                                                                 │
+│  Day 1-2:  Research & design detection methodology              │
+│            ├─ Study vulnerability class                         │
+│            └─ Define test cases (vulnerable + safe)             │
+│                                                                 │
+│  Day 3-5:  Implement scanning module                            │
+│            ├─ Write scanner class extending ArtemisBase          │
+│            ├─ Implement detection logic                         │
+│            └─ Handle edge cases & false positives               │
+│                                                                 │
+│  Day 6-7:  Implement reporter + email template                  │
+│            ├─ TaskResult → Report conversion                    │
+│            ├─ Jinja2 email template fragment                    │
+│            └─ Severity mapping entry                            │
+│                                                                 │
+│  Day 8-9:  Testing                                              │
+│            ├─ Unit tests with mocked HTTP responses              │
+│            ├─ Reporter tests with sample TaskResults             │
+│            └─ Docker service entry                              │
+│                                                                 │
+│  Day 10:   Documentation + code review prep                     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-**Expected state:** 3 fully functional modules with reporters, email templates, unit tests, severity mappings, and Docker Compose entries. All follow established patterns and pass existing CI checks.
+### Phase-by-Phase Breakdown
 
-### Phase 2: Weeks 5-8 (July 5 - August 3)
+| Phase | Weeks | Modules | Deliverables | Hours |
+|-------|-------|---------|-------------|-------|
+| **Community Bonding** | May 8 - Jun 1 | — | Dev env setup, study patterns, build fingerprint DB, warmup PR | 25 |
+| **Phase 1** | 1-4 | CORS, SecHeaders, OpenRedirect | 3 modules + reporters + tests + Docker entries | 120 |
+| **Midterm** | — | — | 3 fully functional modules passing CI | — |
+| **Phase 2** | 5-8 | SubdomainTakeover, JSSecrets, BackupScanner | 3 modules + reporters + tests + fingerprint/pattern DBs | 120 |
+| **Phase 3** | 9-12 | TLS, SSRF + documentation | 2 modules + E2E tests + docs for all 8 modules | 85 |
+| **Total** | | **8 modules** | ~48 files, ~3500 lines, full test coverage | **350** |
 
-**Deliverable: Modules 4-6 (Subdomain Takeover, JS Secrets, Backup Scanner)**
+---
 
-| Week | Tasks |
-|------|-------|
-| 5 | Implement Subdomain Takeover detector; build fingerprint database |
-| 6 | Implement JS Secrets scanner; build pattern database with entropy filtering |
-| 7 | Implement Backup/Config File scanner with content-type validation |
-| 8 | Reporters, email templates, and comprehensive unit tests for modules 4-6 |
+## Effort Breakdown
 
-### Phase 3: Weeks 9-12 (August 4 - August 31)
+```
+                    Effort Distribution (350 hours)
 
-**Deliverable: Modules 7-8 (TLS, SSRF), documentation, final polish**
-
-| Week | Tasks |
-|------|-------|
-| 9 | Implement TLS/SSL checker module; handle edge cases in certificate validation |
-| 10 | Implement SSRF detector module (opt-in, with safety controls) |
-| 11 | Full integration testing; reporters and tests for modules 7-8; end-to-end scan test |
-| 12 | Documentation for all 8 modules in `docs/`; update module list; final code review prep |
-
-### Final Evaluation (September 1 - September 8)
+  ┌────────────────────────────────────────────────────────┐
+  │                                                        │
+  │  Module 1: CORS Scanner      ████░░░░░░░░░░░  35h     │
+  │  Module 2: Security Headers  ████░░░░░░░░░░░  40h     │
+  │  Module 3: Open Redirect     ████░░░░░░░░░░░  35h     │
+  │  Module 4: Subdomain Takeover████░░░░░░░░░░░  45h     │
+  │  Module 5: JS Secrets        █████░░░░░░░░░░  45h     │
+  │  Module 6: Backup Scanner    ████░░░░░░░░░░░  40h     │
+  │  Module 7: TLS/SSL Checker   █████░░░░░░░░░░  45h     │
+  │  Module 8: SSRF Detector     ████░░░░░░░░░░░  35h     │
+  │  Integration Testing         ██░░░░░░░░░░░░░  15h     │
+  │  Documentation               ██░░░░░░░░░░░░░  15h     │
+  │                                                        │
+  │  Each module includes: scanner + reporter + template    │
+  │  + severity mapping + Docker entry + unit tests         │
+  └────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Technical Challenges and Mitigations
 
-| Challenge | Mitigation |
-|-----------|------------|
-| False positives in CORS detection (CDNs reflect origin by design) | Check `Access-Control-Allow-Credentials` — only report when credentials are exposed |
-| JS secrets scanner may flag placeholder keys | Entropy threshold filtering + exclude list of known test/example keys |
-| Subdomain takeover fingerprints change over time | Store fingerprints in a data file (not hardcoded); make it easy to update |
-| SSRF detection requires callback infrastructure | Use DNS-based detection (check for resolution of unique subdomains); fallback to response-diff |
-| TLS testing requires low-level socket operations | Use Python's `ssl` module with custom contexts; handle connection timeouts gracefully |
-| Backup scanner may trigger WAF blocks | Use `self.forgiving_http_get()` (existing pattern) for resilience to partial failures |
+| Challenge | Risk | Mitigation |
+|-----------|------|------------|
+| False positives in CORS detection (CDNs reflect origin) | Medium | Only report when `Access-Control-Allow-Credentials: true` is present |
+| JS secrets scanner flags placeholder keys | Medium | Entropy threshold filtering + exclude list of known test keys |
+| Subdomain takeover fingerprints change over time | Low | Store in JSON data file, not hardcoded; easy to update |
+| SSRF detection requires callback infrastructure | High | DNS-based detection (no server needed); fallback to response-diff |
+| TLS testing requires low-level socket operations | Low | Python `ssl` module with custom contexts; handle timeouts gracefully |
+| Backup scanner may trigger WAF blocks | Medium | Use `self.forgiving_http_get()` for resilience to partial failures |
+| 8 modules is a lot of code to maintain | Low | Each module is independent; follow existing patterns exactly |
+| Testing requires diverse vulnerable targets | Medium | Create test fixtures with mocked HTTP responses in `test/data/` |
 
 ---
 
