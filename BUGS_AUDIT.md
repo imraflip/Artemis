@@ -265,14 +265,76 @@ Long `top_level_target` strings truncated to same prefix overwrite each other's 
 
 ---
 
+---
+
+## ADDITIONAL FINDINGS (from deep core audit)
+
+### MEDIUM
+
+### 63. `_strip_internal_db_info` mutates SQLAlchemy instance's `__dict__`
+**File:** `artemis/db.py:681-688`
+Called with `item.__dict__`, it deletes keys from the model's internal state. If the instance is used afterward within the same session, this causes subtle data corruption.
+
+### 64. Detached SQLAlchemy instances returned after session close
+**Files:** `artemis/db.py:556-562, 613-621, 698-700`
+`take_single_report_generation_task`, `list_report_generation_tasks`, and `get_tags` return model instances after the `with session` block exits. Accessing lazy-loaded attributes raises `DetachedInstanceError`.
+
+### 65. Log file opened with `"w"` mode — overwrites previous entries on restart
+**File:** `artemis/karton_logger.py:29`
+Log file opened with `"w"` (truncate). If the process restarts same day, all previous log entries are lost. Should be `"a"` (append).
+
+### 66. HTTP session never closed — file descriptor leak
+**File:** `artemis/http_requests.py:94`
+When `session` is not provided, a new `requests.Session()` is created but never closed. Over many requests, this exhausts file descriptors.
+
+### 67. Streamed HTTP response never closed
+**File:** `artemis/http_requests.py:108-136`
+`session.get(..., stream=True)` opens a connection. Content is partially read via `iter_content`, but `response.close()` is never called, leaking connections.
+
+### 68. IPv6 address mangled in `task_utils.get_target_host`
+**File:** `artemis/task_utils.py:59-60`
+For `TaskType.NEW`, `":" in payload` is True for IPv6 addresses. `payload.split(":")[0]` returns empty string or truncated address instead of the full IPv6.
+
+### 69. `placeholder_page_detector` crashes at import if config file missing
+**File:** `artemis/placeholder_page_detector.py:12`
+File opened at module import time. Missing file crashes the entire process at startup, even when placeholder detection is disabled.
+
+### 70. Potential query injection in `_to_postgresql_query`
+**File:** `artemis/db.py:671-678`
+Sanitization replaces backslashes and double quotes but misses single quotes and other PostgreSQL tsquery-special characters. Could cause query failures or unexpected behavior.
+
+### 71. `karton_logger` lock failure leaves file in broken state
+**File:** `artemis/karton_logger.py:35`
+`fcntl.lockf` raises `OSError` on lock failure, but `self.opened_file` is already set. Subsequent `process_log` calls write to an unlocked file, risking corruption.
+
+### LOW
+
+### 72. `_rotate_logs` crashes on non-log files in directory
+**File:** `artemis/karton_logger.py:41`
+`file_name.split(".", 1)` assumes all files have a dot. A file without a dot causes `ValueError` on tuple unpacking.
+
+### 73. Duplicate `"authorization"` key in `HEADERS` dict
+**File:** `artemis/sql_injection_data.py:217`
+Key `"authorization"` appears twice (lines 211 and 217). Second entry silently overwrites the first.
+
+### 74. `crawling.py` BeautifulSoup without parser
+**File:** `artemis/crawling.py:20`
+`BeautifulSoup(response.text)` without parser argument — non-deterministic behavior.
+
+### 75. `get_injectable_parameters` caches indefinitely
+**File:** `artemis/crawling.py:37`
+`@functools.lru_cache(maxsize=8192)` on HTTP-derived data. Long-running process accumulates stale cache entries.
+
+---
+
 ## Summary
 
 | Severity | Count |
 |----------|-------|
 | Critical | 12    |
-| Medium   | 30    |
-| Low      | 20    |
-| **Total**| **62**|
+| Medium   | 39    |
+| Low      | 24    |
+| **Total**| **75**|
 
 ### Top Priority Fixes
 1. **#1** — Lambda closure bug: tasks silently processed with wrong input
